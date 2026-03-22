@@ -6,6 +6,9 @@ import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_location_updater import (
+    resolve_routed_experts_weights_of_layer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -107,8 +110,11 @@ class EPLBManager:
         return True
 
     def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
+        routed_experts_weights_of_layer = resolve_routed_experts_weights_of_layer(
+            self._model_runner.model.routed_experts_weights_of_layer
+        )
         all_layer_ids = sorted(
-            list(self._model_runner.model.routed_experts_weights_of_layer.keys())
+            list(routed_experts_weights_of_layer.keys())
         )
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))

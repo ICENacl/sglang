@@ -40,6 +40,7 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import resolve_lazy_value
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ logger = logging.getLogger(__name__)
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 _LOG_ASYNC_SYNC_DEBUG = get_bool_env_var("SGLANG_EPLB_ASYNC_SYNC_DEBUG")
 _GLOBAL_EXPERT_LOCATION_UPDATER = None
+
+
+def resolve_routed_experts_weights_of_layer(routed_experts_weights_of_layer):
+    return resolve_lazy_value(routed_experts_weights_of_layer)
 
 
 def get_global_expert_location_updater():
@@ -94,6 +99,10 @@ class ExpertLocationUpdater:
     ):
         if not self._enable_async or not torch.cuda.is_available():
             return
+
+        routed_experts_weights_of_layer = resolve_routed_experts_weights_of_layer(
+            routed_experts_weights_of_layer
+        )
 
         for layer_id in sorted(routed_experts_weights_of_layer):
             if layer_id in self._prepared_async_layer_ids:
@@ -193,6 +202,9 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
     ):
+        routed_experts_weights_of_layer = resolve_routed_experts_weights_of_layer(
+            routed_experts_weights_of_layer
+        )
         if self._first_execution:
             self._first_execution = False
             torch.get_device_module().empty_cache()
