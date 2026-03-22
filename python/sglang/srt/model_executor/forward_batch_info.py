@@ -453,7 +453,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob, dtype=torch.int64,pin_memory=True
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
