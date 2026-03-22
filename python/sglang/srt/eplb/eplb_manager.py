@@ -39,7 +39,16 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        self._started_forward_passes = 0
         self._main_generator = self._entrypoint()
+
+    def on_forward_pass_start(self):
+        if not self._server_args.enable_eplb_async:
+            return
+
+        self._started_forward_passes += 1
+        if self._started_forward_passes % self._rebalance_num_iterations == 0:
+            get_global_expert_distribution_recorder().skip_next_forward_pass()
 
     def on_forward_pass_end(self):
         next(self._main_generator)

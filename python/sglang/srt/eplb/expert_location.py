@@ -38,19 +38,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _copy_to_pinned_cpu_if_needed(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.device.type == "cpu":
-        if torch.cuda.is_available() and not tensor.is_pinned():
-            return tensor.pin_memory()
-        return tensor
-    if tensor.device.type == "cuda":
-        cpu_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
-        cpu_tensor.copy_(tensor, non_blocking=True)
-        torch.cuda.current_stream(tensor.device).synchronize()
-        return cpu_tensor
-    return tensor.cpu()
-
-
 def _copy_to_device_if_needed(tensor: torch.Tensor, device: str) -> torch.Tensor:
     if str(tensor.device) == device:
         return tensor
@@ -190,7 +177,9 @@ class ExpertLocationMetadata:
         )
 
         if eplb_algorithms.algorithm_runs_on_cpu(algorithm):
-            logical_count = _copy_to_pinned_cpu_if_needed(logical_count)
+            logical_count = logical_count.to("cpu")
+            if torch.cuda.is_available() and not logical_count.is_pinned():
+                logical_count = logical_count.pin_memory()
         else:
             logical_count = logical_count.to(server_args.device)
 
@@ -243,11 +232,16 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
     ):
+        def _to_pinned_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.device.type == "cpu":
+                return tensor if tensor.is_pinned() else tensor.pin_memory()
+            cpu_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            cpu_tensor.copy_(tensor, non_blocking=True)
+            return cpu_tensor
+
         target_device = server_args.device
-        physical_to_logical_map_cpu = _copy_to_pinned_cpu_if_needed(
-            physical_to_logical_map
-        )
-        logical_to_all_physical_map_cpu = _copy_to_pinned_cpu_if_needed(
+        physical_to_logical_map_cpu = _to_pinned_cpu_tensor(physical_to_logical_map)
+        logical_to_all_physical_map_cpu = _to_pinned_cpu_tensor(
             logical_to_all_physical_map
         )
 
@@ -270,6 +264,10 @@ class ExpertLocationMetadata:
             (0, num_physical_experts - logical_to_all_physical_map_cpu.shape[-1]),
             value=-1,
         )
+        if not logical_to_all_physical_map_padded_cpu.is_pinned():
+            logical_to_all_physical_map_padded_cpu = (
+                logical_to_all_physical_map_padded_cpu.pin_memory()
+            )
 
         logical_to_all_physical_map_num_valid = torch.count_nonzero(
             logical_to_all_physical_map_device != -1, dim=-1
@@ -479,9 +477,9 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
-    logical_to_all_physical_map_cpu = _copy_to_pinned_cpu_if_needed(
-        logical_to_all_physical_map
-    )
+    logical_to_all_physical_map_cpu = logical_to_all_physical_map.to("cpu")
+    if torch.cuda.is_available() and not logical_to_all_physical_map_cpu.is_pinned():
+        logical_to_all_physical_map_cpu = logical_to_all_physical_map_cpu.pin_memory()
 
     num_gpus_per_node = server_args.ep_size // server_args.nnodes
     try:

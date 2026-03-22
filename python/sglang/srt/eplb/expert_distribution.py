@@ -146,6 +146,9 @@ class ExpertDistributionRecorder(ABC):
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
+    def skip_next_forward_pass(self):
+        pass
+
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         pass
 
@@ -182,6 +185,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        self._skip_next_forward_pass = False
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
@@ -218,6 +222,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
+        if self._skip_next_forward_pass:
+            self._skip_next_forward_pass = False
+            yield outputs
+            return
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:
@@ -374,6 +382,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
+
+    def skip_next_forward_pass(self):
+        self._skip_next_forward_pass = True
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         if self._async_logical_count is None:

@@ -2426,8 +2426,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
-        if self.expert_location_updater is not None:
-            self.expert_location_updater.on_forward_pass_start()
+        self.on_forward_pass_start()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
@@ -2470,14 +2469,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
         )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
-        if self.expert_location_updater is not None:
-            self.expert_location_updater.on_forward_pass_end()
+        self.on_forward_pass_end()
 
         return output
 
     def on_forward_pass_start(self):
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_start()
         if self.expert_location_updater is not None:
             self.expert_location_updater.on_forward_pass_start()
 
