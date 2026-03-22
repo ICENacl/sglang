@@ -729,15 +729,19 @@ class CudaGraphRunner:
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
+            self.model_runner.on_eplb_async_forward_pass_start()
             run_once()
+            self.model_runner.on_eplb_async_forward_pass_end()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+        self.model_runner.on_eplb_async_forward_pass_start()
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
+        self.model_runner.on_eplb_async_forward_pass_end()
 
         return graph, out
 

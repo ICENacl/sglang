@@ -50,7 +50,8 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
-        logger.info("[EPLBManager] rebalance start")
+        mode = "async" if self._server_args.enable_eplb_async else "sync"
+        logger.info(f"[EPLBManager] rebalance start mode={mode}")
 
         enable_timing = self._rebalance_layers_per_chunk is None
 

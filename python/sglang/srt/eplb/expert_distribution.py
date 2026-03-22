@@ -28,8 +28,10 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_int_env_var
@@ -38,6 +40,32 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 logger = logging.getLogger(__name__)
+
+
+def _get_eplb_group():
+    if not torch.distributed.is_initialized():
+        return None
+    return get_moe_ep_group()
+
+
+def _get_eplb_reduce_group():
+    eplb_group = _get_eplb_group()
+    if eplb_group is None:
+        return None
+    return eplb_group.device_group
+
+
+def _broadcast_eplb_host_scalar(value):
+    eplb_group = _get_eplb_group()
+    if eplb_group is None:
+        return value
+    payload = [value if eplb_group.rank_in_group == 0 else None]
+    torch.distributed.broadcast_object_list(
+        payload,
+        src=eplb_group.ranks[0],
+        group=eplb_group.cpu_group,
+    )
+    return payload[0]
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
@@ -92,6 +120,9 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
+    def on_select_experts_logical(self, topk_ids: torch.Tensor):
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -114,6 +145,12 @@ class ExpertDistributionRecorder(ABC):
 
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
+
+    def reset_async_layer_statistics(self, layer_ids: List[int]):
+        pass
+
+    def get_async_runtime_reset_tensor_specs(self) -> List[Tuple[torch.Tensor, int]]:
+        return []
 
     @property
     def recording(self):
@@ -138,6 +175,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
+        self._rank = rank
 
         self._recording = False
         self._disable_all = False
@@ -146,6 +184,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
+        )
+        self._enable_async_eplb = server_args.enable_eplb_async
+        self._async_logical_count = (
+            torch.zeros(
+                (
+                    expert_location_metadata.num_layers,
+                    expert_location_metadata.num_logical_experts,
+                ),
+                dtype=torch.int32,
+                device=server_args.device,
+            )
+            if self._enable_async_eplb
+            else None
         )
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
@@ -203,6 +254,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
+    def on_select_experts_logical(self, topk_ids: torch.Tensor):
+        if not self._enable_async_eplb:
+            return
+        if self._server_args.moe_a2a_backend != "none":
+            return
+        self._on_async_logical_hook("_on_select_experts_logical", topk_ids=topk_ids)
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -210,6 +268,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
+        if self._enable_async_eplb:
+            self._on_async_logical_hook(
+                "_on_deepep_dispatch_normal_async",
+                local_physical_count_of_layer=local_physical_count_of_layer,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+            )
         self._on_hook(
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
@@ -221,6 +287,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
+        if self._enable_async_eplb:
+            self._on_async_logical_hook(
+                "_on_deepep_dispatch_low_latency_async",
+                local_physical_count_of_layer=local_physical_count_of_layer,
+            )
         self._on_hook(
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,
@@ -229,9 +300,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
+        if not self._recording:
+            return
+        if self._current_forward_pass_id.value is None:
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -239,6 +310,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         ]
         getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
+
+    def _on_async_logical_hook(self, hook_name: str, **kwargs):
+        if self._disable_all:
+            return
+        if not self._recording:
+            return
+        if self._current_forward_pass_id.value is None:
+            return
+        if self._current_layer_idx.value is None:
+            return
+        getattr(self, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
@@ -249,6 +331,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
+        if self._async_logical_count is not None:
+            self._async_logical_count.zero_()
 
     def start_record(self):
         """Start recording the expert distribution."""
@@ -269,9 +353,118 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(output_mode=output_mode)
+        if self._enable_async_eplb and output_mode == "object":
+            logical_count = self._async_logical_count.unsqueeze(0).clone()
+            reduce_group = _get_eplb_reduce_group()
+            if reduce_group is not None:
+                torch.distributed.all_reduce(
+                    logical_count,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=reduce_group,
+                )
+            output = dict(
+                logical_count=logical_count,
+                average_utilization_rate_over_window=(
+                    self._accumulator._get_global_average_utilization_rate()
+                    if hasattr(self._accumulator, "_get_global_average_utilization_rate")
+                    else None
+                ),
+            )
+        else:
+            output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
+
+    def reset_async_layer_statistics(self, layer_ids: List[int]):
+        if self._async_logical_count is None:
+            return
+        if len(layer_ids) == 0:
+            return
+        self._async_logical_count[layer_ids, :] = 0
+        if (
+            hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
+            and self._accumulator._global_physical_count_of_buffered_step is not None
+        ):
+            self._accumulator._global_physical_count_of_buffered_step.get_all()[
+                :, layer_ids, :
+            ] = 0
+
+    def get_async_runtime_reset_tensor_specs(self) -> List[Tuple[torch.Tensor, int]]:
+        specs: List[Tuple[torch.Tensor, int]] = []
+        if self._async_logical_count is not None:
+            specs.append((self._async_logical_count, 0))
+        if (
+            hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
+            and self._accumulator._global_physical_count_of_buffered_step is not None
+        ):
+            specs.append(
+                (
+                    self._accumulator._global_physical_count_of_buffered_step.get_all(),
+                    1,
+                )
+            )
+        return specs
+
+    def _on_select_experts_logical(self, layer_idx: int, topk_ids: torch.Tensor):
+        logical_count = _convert_per_token_to_logical_count(
+            num_tokens=topk_ids.shape[0],
+            num_layers=1,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            topk_ids_of_layer=topk_ids.unsqueeze(0),
+        )[0]
+        self._async_logical_count[layer_idx, :] += logical_count
+
+    def _on_deepep_dispatch_normal_async(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        local_physical_count_tensor = torch.tensor(
+            local_physical_count_of_layer,
+            dtype=torch.int32,
+            device=self._server_args.device,
+        )
+        global_physical_count = _convert_local_to_global_physical_count(
+            local_physical_count_tensor.unsqueeze(0),
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )[0]
+        self._async_append_global_physical_count(layer_idx, global_physical_count)
+
+    def _on_deepep_dispatch_low_latency_async(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        global_physical_count = _convert_local_to_global_physical_count(
+            local_physical_count_of_layer.unsqueeze(0),
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )[0]
+        self._async_append_global_physical_count(layer_idx, global_physical_count)
+
+    def _async_append_global_physical_count(
+        self, layer_idx: int, global_physical_count: torch.Tensor
+    ):
+        current_metadata = get_global_expert_location_metadata()
+        assert current_metadata is not None
+        physical_to_logical_map = current_metadata.get_physical_to_logical_map_layer(
+            layer_idx
+        )
+        logical_count = torch.zeros(
+            (self._expert_location_metadata.num_logical_experts,),
+            dtype=global_physical_count.dtype,
+            device=global_physical_count.device,
+        )
+        logical_count.scatter_add_(
+            dim=0,
+            index=physical_to_logical_map.to(torch.int64),
+            src=global_physical_count,
+        )
+        self._async_logical_count[layer_idx, :] += logical_count
 
     @property
     def recording(self):
@@ -585,6 +778,25 @@ def _convert_per_token_to_global_physical_count(
     return ans
 
 
+def _convert_per_token_to_logical_count(
+    num_tokens: int,
+    num_layers: int,
+    num_logical_experts: int,
+    topk_ids_of_layer: torch.Tensor,
+) -> torch.Tensor:
+    topk_ids_layer_major = topk_ids_of_layer[:, :num_tokens, :].reshape(num_layers, -1)
+    mask = (topk_ids_layer_major >= 0) & (topk_ids_layer_major < num_logical_experts)
+    index = topk_ids_layer_major.masked_fill(~mask, 0).long()
+    src = mask.int()
+    ans = torch.zeros(
+        (num_layers, num_logical_experts),
+        dtype=topk_ids_of_layer.dtype,
+        device=topk_ids_of_layer.device,
+    )
+    ans.scatter_add_(dim=1, index=index, src=src)
+    return ans
+
+
 def _convert_local_to_global_physical_count(
     local_physical_count: torch.Tensor,
     rank: int,
@@ -876,9 +1088,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        reduce_group = _get_eplb_reduce_group()
+        if reduce_group is not None:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step,
+                op=torch.distributed.ReduceOp.SUM,
+                group=reduce_group,
+            )
 
         output = dict(
             rank=self._rank,
@@ -900,7 +1116,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        eplb_group = _get_eplb_group()
+        if eplb_group is None:
+            return None
+
+        average_utilization_rate_over_window = None
+        if eplb_group.rank_in_group == 0:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -908,16 +1129,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 if window_index in utilization_mean_rates
                 else 0
             )
-
-            avg_rate_tensor = torch.tensor(
-                [average_utilization_rate_over_window],
-                dtype=torch.float32,
-                device="cuda",
-            )
-        else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
-        return avg_rate_tensor.item()
+        return _broadcast_eplb_host_scalar(average_utilization_rate_over_window)
 
 
 def _dump_to_file(name, data):

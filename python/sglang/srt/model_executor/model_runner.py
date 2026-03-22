@@ -69,6 +69,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    EPLBAsyncHostMirrorManager,
+    set_global_eplb_async_host_mirror_manager,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -82,7 +86,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    set_global_expert_location_updater,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
@@ -481,7 +488,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
-        self.expert_location_updater = ExpertLocationUpdater()
+        self.eplb_async_host_mirror_manager = (
+            EPLBAsyncHostMirrorManager(self.server_args, self.model_config)
+            if self.server_args.enable_eplb_async and (not self.is_draft_worker)
+            else None
+        )
+        set_global_eplb_async_host_mirror_manager(self.eplb_async_host_mirror_manager)
+        self.expert_location_updater = ExpertLocationUpdater(
+            enable_async=self.server_args.enable_eplb_async,
+        )
+        set_global_expert_location_updater(self.expert_location_updater)
 
         (
             ElasticEPStateManager.init(self.server_args)
@@ -491,6 +507,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        if self.eplb_async_host_mirror_manager is not None:
+            self.eplb_async_host_mirror_manager.build_from_loaded_model(
+                self.model.routed_experts_weights_of_layer
+            )
+        self.expert_location_updater.prepare_async_layers(
+            self.model.routed_experts_weights_of_layer
+        )
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
@@ -1116,6 +1139,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        if self.server_args.enable_eplb_async:
+            raise RuntimeError(
+                "update_weights_from_disk is incompatible with --enable-eplb-async."
+            )
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -2393,6 +2420,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
@@ -2437,8 +2466,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_end()
 
         return output
+
+    def on_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
+
+    def on_forward_pass_end(self):
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end()
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_end()
+
+    def on_eplb_async_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_forward_pass_start()
+
+    def on_eplb_async_forward_pass_end(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_forward_pass_end()
 
     def _forward_raw(
         self,

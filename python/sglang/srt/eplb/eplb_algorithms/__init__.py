@@ -16,6 +16,15 @@ class EplbAlgorithm(Enum):
     # TODO may have more algorithm later
 
 
+def algorithm_runs_on_cpu(algorithm: EplbAlgorithm) -> bool:
+    return algorithm in [
+        EplbAlgorithm.deepseek,
+        EplbAlgorithm.deepseek_hierarchical,
+        EplbAlgorithm.deepseek_vec_hierarchical,
+        EplbAlgorithm.elasticity_aware,
+    ]
+
+
 def rebalance_experts(
     tokens_per_expert: torch.Tensor,
     num_physical_experts: int,

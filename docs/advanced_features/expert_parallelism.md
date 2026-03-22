@@ -141,6 +141,8 @@ SGLang integrates the [Expert Parallelism Load Balancer (EPLB)](https://github.c
 
 To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase batch sizes to stabilize activation statistics and configure periodic rebalancing (e.g., every 1000 requests) to adapt to evolving workloads. Simulations demonstrate significant improvements in load balancedness (ratio of mean to max computation time), correlating strongly with throughput gains.
 
+SGLang also supports an async EPLB migration backend via `--enable-eplb-async`. In this mode, MoE expert weights are mirrored in shared host memory on `/dev/shm`, copied into a GPU temp buffer on a dedicated EPLB CUDA stream after each rebalance trigger, and then committed to live model parameters after a CUDA event dependency. This mode requires `--enable-eplb`, only supports CUDA EP deployments, and is incompatible with Elastic EP or online weight updates.
+
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 
 

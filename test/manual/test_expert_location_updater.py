@@ -1,4 +1,5 @@
 import os
+import time
 import traceback
 import unittest
 from dataclasses import dataclass
@@ -10,7 +11,11 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 
 from sglang.srt.eplb import expert_location_updater
-from sglang.srt.utils import get_device
+from sglang.srt.eplb.cpp_async_runtime import create_eplb_async_runtime
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    _build_cross_node_transfer_plan,
+    _compute_node_owner_physical_ids,
+)
 from sglang.test.test_utils import CustomTestCase, find_available_port
 from sglang.utils import is_in_ci
 
@@ -62,7 +67,205 @@ class TestExpertLocationUpdater(CustomTestCase):
     def test_gpu(self):
         if is_in_ci():
             return
-        self._test_common(device=get_device())
+        self._test_common(device="cuda")
+
+    def test_async_runtime_signal_cuda_manual(self):
+        if is_in_ci() or not torch.cuda.is_available():
+            return
+
+        runtime = create_eplb_async_runtime(torch.cuda.current_device())
+        try:
+            runtime.register_layer(0)
+
+            runtime.prepare_capture_step(1)
+            enabled = runtime.wait_gpu_stage(0)
+            torch.cuda.current_stream().synchronize()
+            self.assertEqual(int(enabled.cpu().item()), 0)
+
+            runtime.start_iter(2, True)
+            time.sleep(0.01)
+            enabled = runtime.wait_gpu_stage(0)
+            runtime.set_cpu_stage(0)
+            torch.cuda.current_stream().synchronize()
+            self.assertEqual(int(enabled.cpu().item()), 1)
+
+            runtime.wait_for_idle()
+        finally:
+            runtime.shutdown()
+
+    def test_async_host_mirror_single_rank_cpu(self):
+        old_physical_to_logical_map = [0, 1, 2, 3]
+        new_physical_to_logical_map = [3, 1, 0, 2]
+        routed_experts_weights = [
+            torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+            torch.tensor(
+                [[0, 0], [1, 10], [2, 20], [3, 30]],
+                dtype=torch.int64,
+            ),
+        ]
+        host_mirror = {
+            logical_expert_id: [
+                torch.tensor(logical_expert_id, dtype=torch.int64),
+                torch.tensor(
+                    [logical_expert_id, logical_expert_id * 10],
+                    dtype=torch.int64,
+                ),
+            ]
+            for logical_expert_id in range(4)
+        }
+
+        expert_location_updater.update_expert_weights_single_layer_from_logical_host_mirror_direct(
+            routed_experts_weights=routed_experts_weights,
+            old_physical_to_logical_map=old_physical_to_logical_map,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            num_local_physical_experts=4,
+            num_gpu_per_node=1,
+            rank=0,
+            host_expert_tensors_getter=lambda logical_expert_id: host_mirror[
+                logical_expert_id
+            ],
+            copy_stream=None,
+            layer_main_done_event=None,
+            layer_weights_ready_event=None,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                routed_experts_weights[0],
+                torch.tensor([3, 1, 0, 2], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                routed_experts_weights[1],
+                torch.tensor([[3, 30], [1, 10], [0, 0], [2, 20]], dtype=torch.int64),
+            )
+        )
+
+    def test_async_host_mirror_cycle_fallback_cpu(self):
+        old_physical_to_logical_map = [0, 1]
+        new_physical_to_logical_map = [1, 0]
+        routed_experts_weights = [
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([[100, 1000], [200, 2000]], dtype=torch.int64),
+        ]
+        host_mirror = {
+            0: [
+                torch.tensor(0, dtype=torch.int64),
+                torch.tensor([100, 1000], dtype=torch.int64),
+            ],
+            1: [
+                torch.tensor(1, dtype=torch.int64),
+                torch.tensor([200, 2000], dtype=torch.int64),
+            ],
+        }
+
+        debug_logs = expert_location_updater.update_expert_weights_single_layer_from_logical_host_mirror_direct(
+            routed_experts_weights=routed_experts_weights,
+            old_physical_to_logical_map=old_physical_to_logical_map,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            num_local_physical_experts=2,
+            num_gpu_per_node=1,
+            rank=0,
+            host_expert_tensors_getter=lambda logical_expert_id: host_mirror[
+                logical_expert_id
+            ],
+            copy_stream=None,
+            layer_main_done_event=None,
+            layer_weights_ready_event=None,
+            debug=True,
+        )
+
+        self.assertTrue(
+            torch.equal(routed_experts_weights[0], torch.tensor([1, 0], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(
+                routed_experts_weights[1],
+                torch.tensor([[200, 2000], [100, 1000]], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            any("case=host-mirror-fallback" in log for log in debug_logs),
+            debug_logs,
+        )
+
+    def test_async_host_mirror_free_rider_cpu(self):
+        old_physical_to_logical_map = [0, 4, 5]
+        new_physical_to_logical_map = [1, 1, 5]
+        routed_experts_weights = [
+            torch.tensor([0, 4, 5], dtype=torch.int64),
+            torch.tensor([[0, 0], [4, 40], [5, 50]], dtype=torch.int64),
+        ]
+        host_mirror = {
+            1: [
+                torch.tensor(1, dtype=torch.int64),
+                torch.tensor([1, 10], dtype=torch.int64),
+            ],
+            5: [
+                torch.tensor(5, dtype=torch.int64),
+                torch.tensor([5, 50], dtype=torch.int64),
+            ],
+        }
+
+        debug_logs = expert_location_updater.update_expert_weights_single_layer_from_logical_host_mirror_direct(
+            routed_experts_weights=routed_experts_weights,
+            old_physical_to_logical_map=old_physical_to_logical_map,
+            new_physical_to_logical_map=new_physical_to_logical_map,
+            num_local_physical_experts=3,
+            num_gpu_per_node=1,
+            rank=0,
+            host_expert_tensors_getter=lambda logical_expert_id: host_mirror[
+                logical_expert_id
+            ],
+            copy_stream=None,
+            layer_main_done_event=None,
+            layer_weights_ready_event=None,
+            debug=True,
+        )
+
+        self.assertTrue(
+            torch.equal(routed_experts_weights[0], torch.tensor([1, 1, 5], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(
+                routed_experts_weights[1],
+                torch.tensor([[1, 10], [1, 10], [5, 50]], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(any("case=free-rider" in log for log in debug_logs), debug_logs)
+
+    def test_async_host_mirror_node_owner_selection(self):
+        owners = _compute_node_owner_physical_ids(
+            torch.tensor([3, 1, 3, 0, 2, 1], dtype=torch.int64),
+            node_physical_start=0,
+            node_physical_end=6,
+            num_logical_experts=4,
+        )
+        self.assertEqual(owners, [3, 1, 4, 0])
+
+    def test_async_host_mirror_cross_node_transfer_plan(self):
+        availability = torch.tensor(
+            [
+                [1, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.uint8,
+        )
+        self.assertEqual(
+            _build_cross_node_transfer_plan(availability),
+            [
+                (0, 0, 1),
+                (0, 0, 2),
+                (1, 1, 0),
+                (1, 1, 2),
+                (2, 0, 1),
+                (2, 0, 2),
+                (3, 2, 0),
+                (3, 2, 1),
+            ],
+        )
 
     def _test_common(self, device):
         infos = []

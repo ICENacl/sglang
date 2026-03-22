@@ -1323,7 +1323,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
-
     @classmethod
     def init_new(
         cls,

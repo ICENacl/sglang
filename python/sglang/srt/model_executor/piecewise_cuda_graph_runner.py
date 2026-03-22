@@ -365,11 +365,13 @@ class PiecewiseCudaGraphRunner:
             self.moe_layers,
             self.moe_fusions,
         ):
+            self.model_runner.on_eplb_async_forward_pass_start()
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
             )
+        self.model_runner.on_eplb_async_forward_pass_end()
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -544,7 +546,9 @@ class PiecewiseCudaGraphRunner:
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
+            self.model_runner.on_eplb_async_forward_pass_start()
             run_once()
+            self.model_runner.on_eplb_async_forward_pass_end()
 
         return
 

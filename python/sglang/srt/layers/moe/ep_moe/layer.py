@@ -9,6 +9,9 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.eplb.expert_location_updater import (
+    get_global_expert_location_updater,
+)
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -159,32 +162,36 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
-        else:
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.wait_gpu_stage(self.layer_id)
+        try:
+            if is_in_piecewise_cuda_graph():
+                assert TopKOutputChecker.format_is_standard(
+                    topk_output
+                ), "Only standard topk output is supported for piecewise cuda graph"
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
             return self.forward_impl(hidden_states, topk_output)
+        finally:
+            if updater is not None:
+                updater.set_cpu_stage(self.layer_id)
 
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,
                 topk_output,
             )
-
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
@@ -193,7 +200,6 @@ class DeepEPMoE(FusedMoE):
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
-
         return hidden_states
 
     def dispatch(

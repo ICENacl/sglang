@@ -503,6 +503,7 @@ class ServerArgs:
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
+    enable_eplb_async: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
@@ -2228,6 +2229,13 @@ class ServerArgs:
             ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_eplb_async:
+            assert self.enable_eplb, (
+                "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+                "passed together."
+            )
+            assert self.device == "cuda", "EPLB async is only supported on CUDA."
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
@@ -2243,6 +2251,11 @@ class ServerArgs:
             assert self.ep_size > 1
 
     def _handle_elastic_ep(self):
+        if self.enable_eplb_async:
+            assert (
+                self.elastic_ep_backend is None
+            ), "EPLB async is incompatible with elastic EP."
+
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
@@ -4137,6 +4150,11 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--enable-eplb-async",
+            action="store_true",
+            help="Enable async EPLB weight migration backend. Must be used together with --enable-eplb.",
         )
         parser.add_argument(
             "--eplb-algorithm",
