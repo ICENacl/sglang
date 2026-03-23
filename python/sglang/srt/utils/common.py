@@ -3272,12 +3272,6 @@ class LazyValue:
         return self._value
 
 
-def resolve_lazy_value(value):
-    if isinstance(value, LazyValue):
-        return value.value
-    return value
-
-
 def dynamic_import(func_path: str):
     parts = func_path.split(".")
     if len(parts) < 2:

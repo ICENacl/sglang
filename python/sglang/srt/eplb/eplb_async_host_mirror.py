@@ -18,7 +18,6 @@ from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.utils.common import resolve_lazy_value
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +115,6 @@ class EPLBAsyncHostMirrorManager:
         self._maybe_create_leader_groups()
 
     def build_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
-        routed_experts_weights_of_layer = resolve_lazy_value(
-            routed_experts_weights_of_layer
-        )
         metadata = get_global_expert_location_metadata()
         assert metadata is not None, "EPLB async host mirror requires expert metadata."
 

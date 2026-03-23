@@ -88,7 +88,6 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import (
     ExpertLocationUpdater,
-    resolve_routed_experts_weights_of_layer,
     set_global_expert_location_updater,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
@@ -508,15 +507,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
-        routed_experts_weights_of_layer = resolve_routed_experts_weights_of_layer(
-            self.model.routed_experts_weights_of_layer
-        )
         if self.eplb_async_host_mirror_manager is not None:
             self.eplb_async_host_mirror_manager.build_from_loaded_model(
-                routed_experts_weights_of_layer
+                self.model.routed_experts_weights_of_layer
             )
         self.expert_location_updater.prepare_async_layers(
-            routed_experts_weights_of_layer
+            self.model.routed_experts_weights_of_layer
         )
 
         if (
@@ -1128,9 +1124,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         else:
             self.expert_location_updater.update(
-                resolve_routed_experts_weights_of_layer(
-                    self.model.routed_experts_weights_of_layer
-                ),
+                self.model.routed_experts_weights_of_layer,
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
                 nnodes=self.server_args.nnodes,
