@@ -36,18 +36,27 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
-        self._started_forward_passes = 0
+        self._prepared_rebalance_metadata = None
+        self._prepared_update_layer_ids_chunks = None
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_start(self):
         if not self._server_args.enable_eplb_async:
             return
 
-        self._started_forward_passes += 1
-        if self._started_forward_passes % self._rebalance_num_iterations == 0:
-            get_global_expert_distribution_recorder().skip_next_forward_pass()
+        if self._model_runner.forward_pass_id % self._rebalance_num_iterations == 0:
+            self._prepare_async_rebalance()
 
     def on_forward_pass_end(self):
+        if self._server_args.enable_eplb_async:
+            if (
+                self._model_runner.forward_pass_id % self._rebalance_num_iterations
+                == self._rebalance_num_iterations - 1
+            ):
+                get_global_expert_distribution_recorder().skip_next_forward_pass()
+            if self._model_runner.forward_pass_id % self._rebalance_num_iterations == 0:
+                self._apply_prepared_async_rebalance()
+            return
         next(self._main_generator)
 
     # can be more complex if needed
@@ -99,6 +108,41 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def _prepare_async_rebalance(self):
+        logger.info("[EPLBManager] async rebalance prepare start")
+        get_global_expert_distribution_recorder().materialize_async_snapshot()
+        dump_record_output = get_global_expert_distribution_recorder().dump_record(
+            output_mode="object"
+        )
+        logical_count = dump_record_output["logical_count"]
+        average_utilization_rate_over_window = dump_record_output[
+            "average_utilization_rate_over_window"
+        ]
+
+        if not self._check_rebalance_needed(average_utilization_rate_over_window):
+            self._prepared_rebalance_metadata = None
+            self._prepared_update_layer_ids_chunks = None
+            return
+
+        self._prepared_rebalance_metadata = ExpertLocationMetadata.init_by_eplb(
+            self._server_args, self._model_runner.model_config, logical_count
+        )
+        self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
+        logger.info("[EPLBManager] async rebalance prepare end")
+
+    def _apply_prepared_async_rebalance(self):
+        if self._prepared_rebalance_metadata is None:
+            return
+        logger.info("[EPLBManager] async rebalance apply start")
+        for update_layer_ids in self._prepared_update_layer_ids_chunks:
+            self._model_runner.update_expert_location(
+                self._prepared_rebalance_metadata,
+                update_layer_ids=update_layer_ids,
+            )
+        self._prepared_rebalance_metadata = None
+        self._prepared_update_layer_ids_chunks = None
+        logger.info("[EPLBManager] async rebalance apply end")
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:

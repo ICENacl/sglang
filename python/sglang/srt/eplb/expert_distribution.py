@@ -149,6 +149,9 @@ class ExpertDistributionRecorder(ABC):
     def skip_next_forward_pass(self):
         pass
 
+    def materialize_async_snapshot(self):
+        pass
+
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         pass
 
@@ -202,6 +205,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             if self._enable_async_eplb
             else None
         )
+        self._async_logical_count_snapshot = None
+        self._async_logical_count_snapshot_event = None
+        self._async_logical_count_snapshot_pending = False
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -341,6 +347,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._accumulator.reset()
         if self._async_logical_count is not None:
             self._async_logical_count.zero_()
+        self._async_logical_count_snapshot = None
+        self._async_logical_count_snapshot_event = None
+        self._async_logical_count_snapshot_pending = False
 
     def start_record(self):
         """Start recording the expert distribution."""
@@ -362,7 +371,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
         if self._enable_async_eplb and output_mode == "object":
-            logical_count = self._async_logical_count.unsqueeze(0).clone()
+            logical_count = self._async_logical_count_snapshot
+            if logical_count is None:
+                logical_count = self._async_logical_count.unsqueeze(0).clone()
             reduce_group = _get_eplb_reduce_group()
             if reduce_group is not None:
                 torch.distributed.all_reduce(
@@ -384,7 +395,36 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return output
 
     def skip_next_forward_pass(self):
+        if self._async_logical_count is not None:
+            if self._async_logical_count.is_cuda:
+                self._async_logical_count_snapshot_event = torch.cuda.Event(
+                    enable_timing=False
+                )
+                self._async_logical_count_snapshot_event.record(
+                    torch.cuda.current_stream(
+                        device=self._async_logical_count.device
+                    )
+                )
+                self._async_logical_count_snapshot_pending = True
+            else:
+                self._async_logical_count_snapshot = (
+                    self._async_logical_count.unsqueeze(0).clone()
+                )
+                self._async_logical_count_snapshot_pending = False
         self._skip_next_forward_pass = True
+
+    def materialize_async_snapshot(self):
+        if not self._async_logical_count_snapshot_pending:
+            return
+        if self._async_logical_count_snapshot_event is not None:
+            torch.cuda.current_stream(
+                device=self._async_logical_count.device
+            ).wait_event(self._async_logical_count_snapshot_event)
+            self._async_logical_count_snapshot_event = None
+        self._async_logical_count_snapshot = (
+            self._async_logical_count.unsqueeze(0).clone()
+        )
+        self._async_logical_count_snapshot_pending = False
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         if self._async_logical_count is None:
