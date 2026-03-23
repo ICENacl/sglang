@@ -920,6 +920,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1002,6 +1009,10 @@ class Qwen3MoeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1127,17 +1138,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = LazyValue(
-                lambda: {
-                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                    for layer_id in range(self.start_layer, self.end_layer)
-                    if isinstance(
-                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
-                    )
-                }
-            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
