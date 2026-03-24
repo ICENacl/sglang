@@ -115,25 +115,22 @@ class EPLBAsyncHostMirrorManager:
         self._maybe_create_leader_groups()
 
     def build_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
+        metadata = get_global_expert_location_metadata()
+        assert metadata is not None, "EPLB async host mirror requires expert metadata."
+
         self._create_records(routed_experts_weights_of_layer)
         if self._can_reuse_existing_data():
             logger.info("Reusing existing EPLB async host mirror shared memory data.")
-            self._attach_layer_tensors(routed_experts_weights_of_layer)
-            return
-
-        metadata = get_global_expert_location_metadata()
-        assert metadata is not None, "EPLB async host mirror requires expert metadata."
-        self._populate_local_node_shards(
-            routed_experts_weights_of_layer=routed_experts_weights_of_layer,
-            metadata=metadata,
-        )
-        self._barrier_all_ranks()
-        self._fill_missing_from_remote_nodes()
-        self._barrier_all_ranks()
+        else:
+            self._populate_local_node_shards(
+                routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+                metadata=metadata,
+            )
+            self._barrier_all_ranks()
+            self._fill_missing_from_remote_nodes()
+            self._barrier_all_ranks()
         self._validate_completeness()
-        self._attach_layer_tensors(routed_experts_weights_of_layer)
 
-    def _attach_layer_tensors(self, routed_experts_weights_of_layer) -> None:
         for layer_id, tensors in routed_experts_weights_of_layer.items():
             attached = []
             for tensor_index, _ in enumerate(tensors):
@@ -291,7 +288,7 @@ class EPLBAsyncHostMirrorManager:
 
         for tensor_index in range(self._layer_num_tensors[layer_id]):
             record = self._records[(layer_id, tensor_index)]
-            staging = self._get_or_create_staging_buffer(layer_id, tensor_index, record)
+            staging = self._staging_buffers[(layer_id, tensor_index)]
             if self._node_rank == src_node_rank:
                 staging.copy_(record.tensor[logical_expert_id], non_blocking=False)
                 self._send_tensor(staging, dst_global_rank)
@@ -375,27 +372,12 @@ class EPLBAsyncHostMirrorManager:
             is_owner=is_owner,
             unlink_on_close=unlink_on_close,
         )
-        return tensor
-
-    def _get_or_create_staging_buffer(
-        self,
-        layer_id: int,
-        tensor_index: int,
-        record: _ShmRecord,
-    ) -> torch.Tensor:
-        key = (layer_id, tensor_index)
-        staging = self._staging_buffers.get(key)
-        if staging is not None:
-            return staging
-
-        sample_tensor = record.tensor[0]
-        staging = torch.empty(
-            sample_tensor.shape,
+        self._staging_buffers[key] = torch.empty(
+            tensor.shape[1:],
             dtype=sample_tensor.dtype,
-            device=self._server_args.device,
+            device=sample_tensor.device,
         )
-        self._staging_buffers[key] = staging
-        return staging
+        return tensor
 
     def _get_or_create_valid_tensor(self, layer_id: int) -> torch.Tensor:
         if layer_id in self._valid_records:

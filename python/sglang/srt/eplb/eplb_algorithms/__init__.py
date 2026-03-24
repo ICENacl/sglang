@@ -18,6 +18,7 @@ class EplbAlgorithm(Enum):
 
 def algorithm_runs_on_cpu(algorithm: EplbAlgorithm) -> bool:
     return algorithm in [
+        EplbAlgorithm.deepseek,
         EplbAlgorithm.deepseek_hierarchical,
         EplbAlgorithm.deepseek_vec_hierarchical,
         EplbAlgorithm.elasticity_aware,
