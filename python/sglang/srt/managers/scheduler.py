@@ -3157,6 +3157,7 @@ def run_scheduler_process(
             )
 
         pipe_writer.send(result_dict)
+        scheduler.tp_worker.model_runner.build_eplb_async_host_mirror()
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

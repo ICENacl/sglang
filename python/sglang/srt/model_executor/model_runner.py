@@ -507,10 +507,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
-        if self.eplb_async_host_mirror_manager is not None:
-            self.eplb_async_host_mirror_manager.build_from_loaded_model(
-                self.model.routed_experts_weights_of_layer
-            )
         self.expert_location_updater.prepare_async_layers(
             self.model.routed_experts_weights_of_layer
         )
@@ -2486,6 +2482,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def on_eplb_async_forward_pass_end(self):
         if self.expert_location_updater is not None:
             self.expert_location_updater.on_capture_forward_pass_end()
+
+    def build_eplb_async_host_mirror(self):
+        if self.eplb_async_host_mirror_manager is None:
+            return
+        self.eplb_async_host_mirror_manager.build_from_loaded_model(
+            self.model.routed_experts_weights_of_layer
+        )
 
     def _forward_raw(
         self,
