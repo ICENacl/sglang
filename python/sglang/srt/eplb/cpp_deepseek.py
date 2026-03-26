@@ -2,12 +2,18 @@ from pathlib import Path
 
 from torch.utils.cpp_extension import load
 
+from sglang.srt.utils import get_torch_extension_build_directory
+
 _ABS_PATH = Path(__file__).resolve().parent
 _JIT_CSRC_PATH = _ABS_PATH.parents[1] / "jit_kernel" / "csrc"
 _SOURCES = [(_JIT_CSRC_PATH / "eplb_deepseek.cpp").resolve()]
 
 _eplb_deepseek_cpp = None
 _eplb_deepseek_cpp_error = None
+
+
+def _get_eplb_deepseek_build_directory() -> str:
+    return get_torch_extension_build_directory(_ABS_PATH, "eplb_deepseek_cpp")
 
 
 def _load_eplb_deepseek_cpp():
@@ -27,6 +33,7 @@ def _load_eplb_deepseek_cpp():
         _eplb_deepseek_cpp = load(
             name="eplb_deepseek_cpp",
             sources=[str(path) for path in _SOURCES],
+            build_directory=_get_eplb_deepseek_build_directory(),
             extra_cflags=["-O3", "-std=c++17"],
             with_cuda=False,
         )
@@ -60,3 +67,7 @@ def rebalance_experts_cpp(
         num_gpus,
         enable_hierarchical,
     )
+
+
+def warmup_eplb_deepseek_cpp():
+    _load_eplb_deepseek_cpp()

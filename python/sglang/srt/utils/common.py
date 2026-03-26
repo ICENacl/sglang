@@ -105,6 +105,16 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
+def get_torch_extension_build_directory(base_path: Path, module_name: str) -> str:
+    base_dir = os.getenv("TORCH_EXTENSIONS_DIR")
+    if base_dir:
+        build_dir = Path(base_dir) / module_name
+    else:
+        build_dir = base_path.parents[4] / ".cache" / "torch_extensions" / module_name
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return str(build_dir)
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
 def is_hip() -> bool:

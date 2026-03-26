@@ -2,6 +2,8 @@ from pathlib import Path
 
 from torch.utils.cpp_extension import load
 
+from sglang.srt.utils import get_torch_extension_build_directory
+
 _ABS_PATH = Path(__file__).resolve().parent
 _JIT_CSRC_PATH = _ABS_PATH.parents[1] / "jit_kernel" / "csrc"
 _SOURCES = [(_JIT_CSRC_PATH / "eplb_expert_location.cpp").resolve()]
@@ -27,6 +29,9 @@ def _load_eplb_expert_location_cpp():
         _eplb_expert_location_cpp = load(
             name="eplb_expert_location_cpp",
             sources=[str(path) for path in _SOURCES],
+            build_directory=get_torch_extension_build_directory(
+                _ABS_PATH, "eplb_expert_location_cpp"
+            ),
             extra_cflags=["-O3", "-std=c++17"],
             with_cuda=False,
         )
@@ -53,3 +58,7 @@ def compute_logical_to_rank_dispatch_physical_map_cpp(
         num_gpus_per_node,
         seed,
     )
+
+
+def warmup_eplb_expert_location_cpp():
+    _load_eplb_expert_location_cpp()

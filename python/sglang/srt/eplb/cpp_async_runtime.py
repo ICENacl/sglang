@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from sglang.srt.utils import get_torch_extension_build_directory
+
 _ABS_PATH = Path(__file__).resolve().parent
 _JIT_CSRC_PATH = _ABS_PATH.parents[1] / "jit_kernel" / "csrc"
 _RUNTIME_SOURCES = [
@@ -25,6 +27,9 @@ def _load_eplb_async_runtime_cpp():
     _eplb_async_runtime_cpp = load(
         name="eplb_async_runtime_cpp",
         sources=[str(path) for path in _RUNTIME_SOURCES],
+        build_directory=get_torch_extension_build_directory(
+            _ABS_PATH, "eplb_async_runtime_cpp"
+        ),
         extra_cflags=["-O3", "-std=c++20"],
         extra_cuda_cflags=["-O3"],
         extra_ldflags=["-lcudart"],
@@ -35,6 +40,10 @@ def _load_eplb_async_runtime_cpp():
 
 def create_eplb_async_runtime(device_index: int):
     return _load_eplb_async_runtime_cpp().EPLBAsyncRuntime(device_index)
+
+
+def warmup_eplb_async_runtime_cpp():
+    _load_eplb_async_runtime_cpp()
 
 
 def create_metadata_field_pair(current: torch.Tensor, next_tensor: torch.Tensor):

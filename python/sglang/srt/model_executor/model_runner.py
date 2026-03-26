@@ -73,6 +73,10 @@ from sglang.srt.eplb.eplb_async_host_mirror import (
     EPLBAsyncHostMirrorManager,
     set_global_eplb_async_host_mirror_manager,
 )
+from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -82,6 +86,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -504,6 +509,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.elastic_ep_backend
             else None
         )
+        self._warmup_eplb_cpp_extensions()
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -1099,6 +1105,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _warmup_eplb_cpp_extensions(self):
+        if not self.server_args.enable_eplb or self.is_draft_worker:
+            return
+
+        model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
+            self.model_config
+        )
+        if model_config_for_expert_location is None:
+            return
+
+        logger.info("Warming up EPLB C++ extensions.")
+        warmup_eplb_expert_location_cpp()
+
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=self.server_args.eplb_algorithm,
+            num_groups=model_config_for_expert_location.num_groups,
+            num_nodes=self.server_args.nnodes,
+        )
+        if algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]:
+            warmup_eplb_deepseek_cpp()
+
+        if self.server_args.enable_eplb_async:
+            warmup_eplb_async_runtime_cpp()
 
     def update_expert_location(
         self,
