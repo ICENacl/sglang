@@ -1102,9 +1102,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
         if self._server_args.enable_eplb_async and not include_in_rebalance_window:
             return
+        buffered_global_physical_count = single_pass_data["global_physical_count"]
+        if self._server_args.enable_eplb_async:
+            buffered_global_physical_count = single_pass_data.get(
+                "metric_global_physical_count",
+                buffered_global_physical_count,
+            )
         # Can optimize if overhead here is large
         self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
+            buffered_global_physical_count
         )
 
     def reset(self):
