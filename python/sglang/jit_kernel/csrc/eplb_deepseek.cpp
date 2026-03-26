@@ -252,5 +252,6 @@ PYBIND11_MODULE(eplb_deepseek_cpp, m) {
       py::arg("num_groups"),
       py::arg("num_nodes"),
       py::arg("num_gpus"),
-      py::arg("enable_hierarchical"));
+      py::arg("enable_hierarchical"),
+      py::call_guard<py::gil_scoped_release>());
 }

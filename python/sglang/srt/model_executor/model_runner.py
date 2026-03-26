@@ -2462,6 +2462,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            self.on_forward_graph_launched()
             elastic_ep_state = ElasticEPStateManager.instance()
             if (
                 elastic_ep_state is not None
@@ -2483,6 +2484,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend,
                     split_forward_count,
                 )
+                self.on_forward_graph_launched()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
@@ -2507,6 +2509,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eplb_manager.on_forward_pass_end()
         if self.expert_location_updater is not None:
             self.expert_location_updater.on_forward_pass_end()
+
+    def on_forward_graph_launched(self):
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_graph_launched()
 
     def on_eplb_async_forward_pass_start(self):
         if self.expert_location_updater is not None:
