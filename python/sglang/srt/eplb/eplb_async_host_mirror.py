@@ -73,6 +73,73 @@ def _build_cross_node_transfer_plan(
     return plan
 
 
+def _build_node_availability_from_metadata(
+    physical_to_logical_map: torch.Tensor,
+    *,
+    num_nodes: int,
+    local_world_size: int,
+    num_local_physical_experts: int,
+    num_logical_experts: int,
+) -> torch.Tensor:
+    availability = torch.zeros((num_nodes, num_logical_experts), dtype=torch.uint8)
+    experts_per_node = local_world_size * num_local_physical_experts
+    for node_rank in range(num_nodes):
+        node_physical_start = node_rank * experts_per_node
+        node_physical_end = node_physical_start + experts_per_node
+        owners = _compute_node_owner_physical_ids(
+            physical_to_logical_map,
+            node_physical_start=node_physical_start,
+            node_physical_end=node_physical_end,
+            num_logical_experts=num_logical_experts,
+        )
+        for logical_expert_id, global_physical_expert_id in enumerate(owners):
+            if global_physical_expert_id != -1:
+                availability[node_rank, logical_expert_id] = 1
+    return availability
+
+
+def _group_cross_node_transfer_plan(
+    transfer_plan: list[tuple[int, int, int]],
+) -> list[tuple[int, int, tuple[int, ...]]]:
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for logical_expert_id, src_node_rank, dst_node_rank in transfer_plan:
+        grouped.setdefault((src_node_rank, dst_node_rank), []).append(logical_expert_id)
+    return [
+        (src_node_rank, dst_node_rank, tuple(logical_expert_ids))
+        for (src_node_rank, dst_node_rank), logical_expert_ids in sorted(grouped.items())
+    ]
+
+
+def _compute_local_owner_indices(
+    physical_to_logical_map: torch.Tensor,
+    *,
+    rank: int,
+    num_local_physical_experts: int,
+    node_physical_start: int,
+    node_physical_end: int,
+    num_logical_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    node_owner_physical_ids = _compute_node_owner_physical_ids(
+        physical_to_logical_map,
+        node_physical_start=node_physical_start,
+        node_physical_end=node_physical_end,
+        num_logical_experts=num_logical_experts,
+    )
+    local_physical_start = rank * num_local_physical_experts
+    local_expert_ids = []
+    logical_expert_ids = []
+    for local_expert_id in range(num_local_physical_experts):
+        global_physical_expert_id = local_physical_start + local_expert_id
+        logical_expert_id = int(physical_to_logical_map[global_physical_expert_id].item())
+        if node_owner_physical_ids[logical_expert_id] == global_physical_expert_id:
+            local_expert_ids.append(local_expert_id)
+            logical_expert_ids.append(logical_expert_id)
+    return (
+        torch.tensor(local_expert_ids, dtype=torch.int64),
+        torch.tensor(logical_expert_ids, dtype=torch.int64),
+    )
+
+
 @dataclass
 class _ShmRecord:
     shm: shared_memory.SharedMemory
@@ -103,7 +170,8 @@ class EPLBAsyncHostMirrorManager:
         self._valid_records: dict[int, _ShmRecord] = {}
         self._layer_tensors: dict[int, list[torch.Tensor]] = {}
         self._layer_num_tensors: dict[int, int] = {}
-        self._staging_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._gpu_staging_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._cpu_transfer_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._leader_device_group = None
         self._leader_cpu_group = None
         self._leader_global_ranks: list[int] = []
@@ -129,31 +197,66 @@ class EPLBAsyncHostMirrorManager:
             len(tensors) for tensors in routed_experts_weights_of_layer.values()
         )
         num_local_fill_steps = num_layers * metadata.num_local_physical_experts
+        layer_transfer_plan = self._build_grouped_cross_node_transfer_plan(
+            routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+            metadata=metadata,
+        )
+        (
+            local_remote_transfer_steps,
+            remote_transfer_experts,
+            remote_transfer_bytes,
+        ) = self._summarize_transfer_plan(
+            layer_transfer_plan,
+            routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+        )
         pbar = tqdm(
-            total=num_layers + num_tensor_records + num_local_fill_steps + num_tensor_records,
+            total=(
+                num_layers
+                + num_tensor_records
+                + num_local_fill_steps
+                + local_remote_transfer_steps
+                + num_tensor_records
+            ),
             desc="Building EPLB async host mirror",
             disable=self._rank != 0,
             dynamic_ncols=True,
         )
         reused_existing_data = False
-        remote_transfer_count = 0
+        phase_times = {
+            "create_records": 0.0,
+            "populate_local": 0.0,
+            "remote_transfer": 0.0,
+            "attach": 0.0,
+        }
 
         try:
+            phase_start = time.time()
             self._create_records(routed_experts_weights_of_layer, pbar=pbar)
+            phase_times["create_records"] = time.time() - phase_start
             reused_existing_data = self._can_reuse_existing_data()
             if reused_existing_data:
-                pbar.update(num_local_fill_steps)
+                pbar.update(num_local_fill_steps + local_remote_transfer_steps)
+                remote_transfer_experts = 0
+                remote_transfer_bytes = 0
             else:
+                phase_start = time.time()
                 self._populate_local_node_shards(
                     routed_experts_weights_of_layer=routed_experts_weights_of_layer,
                     metadata=metadata,
                     pbar=pbar,
                 )
+                phase_times["populate_local"] = time.time() - phase_start
                 self._barrier_all_ranks()
-                remote_transfer_count = self._fill_missing_from_remote_nodes(pbar=pbar)
+                phase_start = time.time()
+                self._fill_missing_from_remote_nodes(
+                    layer_transfer_plan=layer_transfer_plan,
+                    pbar=pbar,
+                )
+                phase_times["remote_transfer"] = time.time() - phase_start
                 self._barrier_all_ranks()
             self._validate_completeness()
 
+            phase_start = time.time()
             for layer_id, tensors in routed_experts_weights_of_layer.items():
                 attached = []
                 for tensor_index, _ in enumerate(tensors):
@@ -165,6 +268,7 @@ class EPLBAsyncHostMirrorManager:
                     attached.append(record.tensor)
                     pbar.update(1)
                 self._layer_tensors[layer_id] = attached
+            phase_times["attach"] = time.time() - phase_start
         finally:
             pbar.close()
 
@@ -173,12 +277,20 @@ class EPLBAsyncHostMirrorManager:
             shm_nbytes = self._get_total_shm_nbytes()
             logger.info(
                 "EPLB async host mirror build complete: reused_existing_data=%s "
-                "layers=%s tensor_records=%s remote_transfers=%s shm=%s elapsed=%.2fs",
+                "layers=%s tensor_records=%s remote_transfer_experts=%s "
+                "remote_transfer_bytes=%s shm=%s "
+                "create_records=%.2fs populate_local=%.2fs remote_transfer=%.2fs "
+                "attach=%.2fs elapsed=%.2fs",
                 reused_existing_data,
                 num_layers,
                 num_tensor_records,
-                remote_transfer_count,
+                remote_transfer_experts,
+                _format_nbytes(remote_transfer_bytes),
                 _format_nbytes(shm_nbytes),
+                phase_times["create_records"],
+                phase_times["populate_local"],
+                phase_times["remote_transfer"],
+                phase_times["attach"],
                 time.time() - build_start,
             )
 
@@ -216,7 +328,8 @@ class EPLBAsyncHostMirrorManager:
         self._valid_records.clear()
         self._layer_tensors.clear()
         self._layer_num_tensors.clear()
-        self._staging_buffers.clear()
+        self._gpu_staging_buffers.clear()
+        self._cpu_transfer_buffers.clear()
         self._leader_device_group = None
         self._leader_cpu_group = None
 
@@ -258,87 +371,68 @@ class EPLBAsyncHostMirrorManager:
         self, *, routed_experts_weights_of_layer, metadata, pbar=None
     ) -> None:
         num_local_physical_experts = metadata.num_local_physical_experts
-        local_physical_start = self._rank * num_local_physical_experts
         node_physical_start = self._node_rank * self._local_world_size * num_local_physical_experts
         node_physical_end = node_physical_start + self._local_world_size * num_local_physical_experts
 
         for layer_id, tensors in routed_experts_weights_of_layer.items():
-            node_owner_physical_ids = _compute_node_owner_physical_ids(
+            local_expert_ids_cpu, logical_expert_ids_cpu = _compute_local_owner_indices(
                 metadata.physical_to_logical_map_cpu[layer_id],
+                rank=self._rank,
+                num_local_physical_experts=num_local_physical_experts,
                 node_physical_start=node_physical_start,
                 node_physical_end=node_physical_end,
                 num_logical_experts=self._num_logical_experts,
             )
+            if local_expert_ids_cpu.numel() == 0:
+                continue
             valid_tensor = self._valid_records[layer_id].tensor
+            local_expert_ids = local_expert_ids_cpu.to(device=tensors[0].device)
+            for tensor_index, tensor in enumerate(tensors):
+                record = self._records[(layer_id, tensor_index)]
+                packed = tensor.index_select(0, local_expert_ids).cpu()
+                record.tensor.index_copy_(0, logical_expert_ids_cpu, packed)
+            valid_tensor.index_fill_(0, logical_expert_ids_cpu, 1)
+            if pbar is not None:
+                pbar.update(local_expert_ids_cpu.numel())
 
-            for local_expert_id in range(num_local_physical_experts):
-                global_physical_expert_id = local_physical_start + local_expert_id
-                logical_expert_id = int(
-                    metadata.physical_to_logical_map_cpu[
-                        layer_id, global_physical_expert_id
-                    ].item()
-                )
-                if node_owner_physical_ids[logical_expert_id] != global_physical_expert_id:
-                    continue
-
-                for tensor_index, tensor in enumerate(tensors):
-                    record = self._records[(layer_id, tensor_index)]
-                    record.tensor[logical_expert_id].copy_(tensor[local_expert_id].cpu())
-                valid_tensor[logical_expert_id] = 1
-                if pbar is not None:
-                    pbar.update(1)
-
-    def _fill_missing_from_remote_nodes(self, pbar=None) -> int:
+    def _fill_missing_from_remote_nodes(self, *, layer_transfer_plan, pbar=None) -> None:
         if self._leader_cpu_group is None:
-            return 0
+            return
         if not self._is_owner:
-            return 0
+            return
 
-        local_transfer_count = 0
-        for layer_id in sorted(self._valid_records):
-            local_bitmap = self._valid_records[layer_id].tensor.clone()
-            gathered = [torch.empty_like(local_bitmap) for _ in range(self._num_nodes)]
-            dist.all_gather(gathered, local_bitmap, group=self._leader_cpu_group)
-            availability = torch.stack(gathered, dim=0)
-            transfer_plan = _build_cross_node_transfer_plan(availability)
-            local_layer_transfer_count = sum(
-                1
-                for _, src_node_rank, dst_node_rank in transfer_plan
-                if self._node_rank in (src_node_rank, dst_node_rank)
-            )
-            local_transfer_count += local_layer_transfer_count
-            if pbar is not None and local_layer_transfer_count > 0:
-                pbar.total += local_layer_transfer_count
-                pbar.refresh()
-            if len(transfer_plan) == 0:
+        for layer_id in sorted(layer_transfer_plan):
+            transfer_groups = layer_transfer_plan[layer_id]
+            if len(transfer_groups) == 0:
                 continue
 
-            for logical_expert_id, src_node_rank, dst_node_rank in transfer_plan:
+            for src_node_rank, dst_node_rank, logical_expert_ids in transfer_groups:
                 if self._node_rank not in (src_node_rank, dst_node_rank):
                     continue
-                self._transfer_logical_expert(
+                self._transfer_logical_expert_group(
                     layer_id=layer_id,
-                    logical_expert_id=logical_expert_id,
                     src_node_rank=src_node_rank,
                     dst_node_rank=dst_node_rank,
+                    logical_expert_ids=logical_expert_ids,
                 )
                 if pbar is not None:
-                    pbar.update(1)
+                    pbar.update(self._layer_num_tensors[layer_id])
 
             dist.barrier(group=self._leader_cpu_group)
-        return local_transfer_count
 
-    def _transfer_logical_expert(
+    def _transfer_logical_expert_group(
         self,
         *,
         layer_id: int,
-        logical_expert_id: int,
         src_node_rank: int,
         dst_node_rank: int,
+        logical_expert_ids: tuple[int, ...],
     ) -> None:
         assert self._leader_global_ranks
         src_global_rank = self._leader_global_ranks[src_node_rank]
         dst_global_rank = self._leader_global_ranks[dst_node_rank]
+        logical_expert_ids_cpu = torch.tensor(logical_expert_ids, dtype=torch.int64)
+        num_logical_experts = len(logical_expert_ids)
 
         if self._node_rank == dst_node_rank:
             valid_tensor = self._valid_records[layer_id].tensor
@@ -347,16 +441,24 @@ class EPLBAsyncHostMirrorManager:
 
         for tensor_index in range(self._layer_num_tensors[layer_id]):
             record = self._records[(layer_id, tensor_index)]
-            staging = self._staging_buffers[(layer_id, tensor_index)]
+            gpu_staging, cpu_transfer = self._get_or_create_transfer_buffers(
+                layer_id=layer_id,
+                tensor_index=tensor_index,
+                num_logical_experts=num_logical_experts,
+            )
             if self._node_rank == src_node_rank:
-                staging.copy_(record.tensor[logical_expert_id], non_blocking=False)
-                self._send_tensor(staging, dst_global_rank)
+                gpu_staging.copy_(
+                    record.tensor.index_select(0, logical_expert_ids_cpu),
+                    non_blocking=False,
+                )
+                self._send_tensor(gpu_staging, dst_global_rank)
             elif self._node_rank == dst_node_rank:
-                self._recv_tensor(staging, src_global_rank)
-                record.tensor[logical_expert_id].copy_(staging, non_blocking=False)
+                self._recv_tensor(gpu_staging, src_global_rank)
+                cpu_transfer.copy_(gpu_staging, non_blocking=False)
+                record.tensor.index_copy_(0, logical_expert_ids_cpu, cpu_transfer)
 
         if valid_tensor is not None:
-            valid_tensor[logical_expert_id] = 1
+            valid_tensor.index_fill_(0, logical_expert_ids_cpu, 1)
 
     def _send_tensor(self, tensor: torch.Tensor, dst_global_rank: int) -> None:
         if tensor.is_cuda:
@@ -431,10 +533,15 @@ class EPLBAsyncHostMirrorManager:
             is_owner=is_owner,
             unlink_on_close=unlink_on_close,
         )
-        self._staging_buffers[key] = torch.empty(
-            tensor.shape[1:],
+        self._gpu_staging_buffers[key] = torch.empty(
+            (1, *tensor.shape[1:]),
             dtype=sample_tensor.dtype,
             device=sample_tensor.device,
+        )
+        self._cpu_transfer_buffers[key] = torch.empty(
+            (1, *tensor.shape[1:]),
+            dtype=sample_tensor.dtype,
+            pin_memory=True,
         )
         return tensor
 
@@ -543,6 +650,65 @@ class EPLBAsyncHostMirrorManager:
         for record in self._valid_records.values():
             total += getattr(record.shm, "size", 0)
         return total
+
+    def _build_grouped_cross_node_transfer_plan(
+        self, *, routed_experts_weights_of_layer, metadata
+    ) -> dict[int, list[tuple[int, int, tuple[int, ...]]]]:
+        plan = {}
+        num_local_physical_experts = metadata.num_local_physical_experts
+        for layer_id in sorted(routed_experts_weights_of_layer):
+            availability = _build_node_availability_from_metadata(
+                metadata.physical_to_logical_map_cpu[layer_id],
+                num_nodes=self._num_nodes,
+                local_world_size=self._local_world_size,
+                num_local_physical_experts=num_local_physical_experts,
+                num_logical_experts=self._num_logical_experts,
+            )
+            plan[layer_id] = _group_cross_node_transfer_plan(
+                _build_cross_node_transfer_plan(availability)
+            )
+        return plan
+
+    def _summarize_transfer_plan(
+        self, layer_transfer_plan, *, routed_experts_weights_of_layer
+    ) -> tuple[int, int, int]:
+        local_steps = 0
+        total_experts = 0
+        total_bytes = 0
+        for layer_id, transfer_groups in layer_transfer_plan.items():
+            num_tensors = len(routed_experts_weights_of_layer[layer_id])
+            for src_node_rank, dst_node_rank, logical_expert_ids in transfer_groups:
+                num_group_experts = len(logical_expert_ids)
+                total_experts += num_group_experts
+                if self._node_rank in (src_node_rank, dst_node_rank):
+                    local_steps += num_tensors
+                for tensor in routed_experts_weights_of_layer[layer_id]:
+                    total_bytes += (
+                        num_group_experts * tensor[0].numel() * tensor.element_size()
+                    )
+        return local_steps, total_experts, total_bytes
+
+    def _get_or_create_transfer_buffers(
+        self, *, layer_id: int, tensor_index: int, num_logical_experts: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (layer_id, tensor_index)
+        gpu_staging = self._gpu_staging_buffers[key]
+        cpu_transfer = self._cpu_transfer_buffers[key]
+        if gpu_staging.shape[0] < num_logical_experts:
+            expanded_shape = (num_logical_experts, *gpu_staging.shape[1:])
+            self._gpu_staging_buffers[key] = torch.empty(
+                expanded_shape,
+                dtype=gpu_staging.dtype,
+                device=gpu_staging.device,
+            )
+            self._cpu_transfer_buffers[key] = torch.empty(
+                expanded_shape,
+                dtype=cpu_transfer.dtype,
+                pin_memory=True,
+            )
+            gpu_staging = self._gpu_staging_buffers[key]
+            cpu_transfer = self._cpu_transfer_buffers[key]
+        return gpu_staging[:num_logical_experts], cpu_transfer[:num_logical_experts]
 
 
 def _create_buffer_tensor(

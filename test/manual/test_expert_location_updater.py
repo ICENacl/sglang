@@ -13,7 +13,10 @@ from torch.multiprocessing import Process
 from sglang.srt.eplb import expert_location_updater
 from sglang.srt.eplb.cpp_async_runtime import create_eplb_async_runtime
 from sglang.srt.eplb.eplb_async_host_mirror import (
+    _build_node_availability_from_metadata,
     _build_cross_node_transfer_plan,
+    _compute_local_owner_indices,
+    _group_cross_node_transfer_plan,
     _compute_node_owner_physical_ids,
 )
 from sglang.test.test_utils import CustomTestCase, find_available_port
@@ -265,6 +268,66 @@ class TestExpertLocationUpdater(CustomTestCase):
                 (3, 2, 0),
                 (3, 2, 1),
             ],
+        )
+
+    def test_async_host_mirror_node_availability_from_metadata(self):
+        availability = _build_node_availability_from_metadata(
+            torch.tensor([0, 1, 2, 1, 3, 0, 3, 4], dtype=torch.int64),
+            num_nodes=2,
+            local_world_size=2,
+            num_local_physical_experts=2,
+            num_logical_experts=5,
+        )
+        self.assertTrue(
+            torch.equal(
+                availability,
+                torch.tensor(
+                    [
+                        [1, 1, 1, 0, 0],
+                        [1, 0, 0, 1, 1],
+                    ],
+                    dtype=torch.uint8,
+                ),
+            )
+        )
+
+    def test_async_host_mirror_grouped_transfer_plan(self):
+        availability = torch.tensor(
+            [
+                [1, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.uint8,
+        )
+        self.assertEqual(
+            _group_cross_node_transfer_plan(
+                _build_cross_node_transfer_plan(availability)
+            ),
+            [
+                (0, 1, (0, 2)),
+                (0, 2, (0, 2)),
+                (1, 0, (1,)),
+                (1, 2, (1,)),
+                (2, 0, (3,)),
+                (2, 1, (3,)),
+            ],
+        )
+
+    def test_async_host_mirror_local_owner_indices(self):
+        local_expert_ids, logical_expert_ids = _compute_local_owner_indices(
+            torch.tensor([0, 1, 2, 1, 3, 0, 3, 4], dtype=torch.int64),
+            rank=1,
+            num_local_physical_experts=2,
+            node_physical_start=4,
+            node_physical_end=8,
+            num_logical_experts=5,
+        )
+        self.assertTrue(
+            torch.equal(local_expert_ids, torch.tensor([0, 1], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(logical_expert_ids, torch.tensor([3, 4], dtype=torch.int64))
         )
 
     def _test_common(self, device):
