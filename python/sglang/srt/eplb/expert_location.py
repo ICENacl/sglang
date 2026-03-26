@@ -26,6 +26,7 @@ import torch.distributed
 import torch.nn.functional as F
 
 from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_deepseek import rebalance_experts_cpp
 from sglang.srt.eplb.cpp_expert_location import (
     compute_logical_to_rank_dispatch_physical_map_cpp,
 )
@@ -175,24 +176,69 @@ class ExpertLocationMetadata:
             num_groups=num_groups,
             num_nodes=num_nodes,
         )
+        use_async_deepseek_cpp = server_args.enable_eplb_async and algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]
 
-        if eplb_algorithms.algorithm_runs_on_cpu(algorithm):
+        if eplb_algorithms.algorithm_runs_on_cpu(algorithm) or use_async_deepseek_cpp:
             logical_count = logical_count.to("cpu")
             if torch.cuda.is_available() and not logical_count.is_pinned():
                 logical_count = logical_count.pin_memory()
         else:
             logical_count = logical_count.to(server_args.device)
 
-        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
-            eplb_algorithms.rebalance_experts(
-                tokens_per_expert=logical_count,
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_physical_experts // common["ep_size"],
-                num_groups=num_groups,
-                num_nodes=num_nodes,
-                algorithm=algorithm,
+        try:
+            if use_async_deepseek_cpp:
+                cpp_num_groups = num_groups
+                if (
+                    algorithm == eplb_algorithms.EplbAlgorithm.deepseek
+                    and cpp_num_groups is None
+                ):
+                    cpp_num_groups = 1
+                physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                    rebalance_experts_cpp(
+                        weight=logical_count.sum(dim=0),
+                        num_replicas=num_physical_experts,
+                        num_groups=cpp_num_groups,
+                        num_nodes=num_nodes,
+                        num_gpus=common["ep_size"],
+                        enable_hierarchical=(
+                            algorithm
+                            == eplb_algorithms.EplbAlgorithm.deepseek_hierarchical
+                        ),
+                    )
+                )
+            else:
+                physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                    eplb_algorithms.rebalance_experts(
+                        tokens_per_expert=logical_count,
+                        num_physical_experts=num_physical_experts,
+                        num_local_physical_experts=num_physical_experts
+                        // common["ep_size"],
+                        num_groups=num_groups,
+                        num_nodes=num_nodes,
+                        algorithm=algorithm,
+                    )
+                )
+        except Exception as exc:
+            if not use_async_deepseek_cpp:
+                raise
+            logger.warning(
+                "Falling back to Python DeepSeek EPLB rebalancer in async path due to C++ extension error: %s",
+                exc,
             )
-        )
+            physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+                eplb_algorithms.rebalance_experts(
+                    tokens_per_expert=logical_count,
+                    num_physical_experts=num_physical_experts,
+                    num_local_physical_experts=num_physical_experts
+                    // common["ep_size"],
+                    num_groups=num_groups,
+                    num_nodes=num_nodes,
+                    algorithm=algorithm,
+                )
+            )
 
         return ExpertLocationMetadata._init_raw(
             server_args=server_args,
