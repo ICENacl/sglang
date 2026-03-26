@@ -10,10 +10,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <deque>
+#include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -25,6 +28,27 @@
 namespace py = pybind11;
 
 namespace {
+
+bool async_sync_debug_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("SGLANG_EPLB_ASYNC_SYNC_DEBUG");
+    if (value == nullptr) {
+      return false;
+    }
+    return std::string(value) == "1" || std::string(value) == "true" ||
+        std::string(value) == "TRUE" || std::string(value) == "on" ||
+        std::string(value) == "ON" || std::string(value) == "yes" ||
+        std::string(value) == "YES";
+  }();
+  return enabled;
+}
+
+void async_sync_debug_log(const std::string& message) {
+  if (!async_sync_debug_enabled()) {
+    return;
+  }
+  std::cerr << "[EPLBAsyncSync] " << message << std::endl;
+}
 
 inline void check_cuda_error(cudaError_t error, const char* what) {
   if (error != cudaSuccess) {
@@ -57,6 +81,21 @@ struct PreparedPlan {
   std::vector<ResetTensorSpec> gpu_reset_tensors;
   std::vector<ResetTensorSpec> cpu_reset_tensors;
 };
+
+std::string describe_layer_plan_copy_counts(const PreparedPlan& prepared_plan) {
+  std::ostringstream oss;
+  oss << "{";
+  bool first = true;
+  for (const auto& layer_plan : prepared_plan.layer_plans) {
+    if (!first) {
+      oss << ", ";
+    }
+    first = false;
+    oss << layer_plan.layer_id << ":" << layer_plan.dst_slots.size();
+  }
+  oss << "}";
+  return oss.str();
+}
 
 struct IterInfo {
   int64_t step = -1;
@@ -153,6 +192,11 @@ class EPLBAsyncRuntime {
 
   void submit_plan(const PreparedPlan& prepared_plan) {
     std::lock_guard<std::mutex> lock(mu_);
+    async_sync_debug_log(
+        "plan_queued update_layers=" +
+        std::to_string(prepared_plan.update_layer_ids.size()) +
+        " copy_pairs_per_layer=" + describe_layer_plan_copy_counts(prepared_plan) +
+        " prepared_queue_before=" + std::to_string(prepared_plan_queue_.size()));
     prepared_plan_queue_.emplace_back(std::make_shared<ActivePlan>(prepared_plan));
     worker_cv_.notify_all();
   }
@@ -248,6 +292,14 @@ class EPLBAsyncRuntime {
         if (active_plan_ == nullptr && !prepared_plan_queue_.empty()) {
           active_plan_ = prepared_plan_queue_.front();
           prepared_plan_queue_.pop_front();
+          async_sync_debug_log(
+              "activate_plan step=" + std::to_string(iter_info.step) +
+              " update_layers=" +
+              std::to_string(active_plan_->plan.update_layer_ids.size()) +
+              " copy_pairs_per_layer=" +
+              describe_layer_plan_copy_counts(active_plan_->plan) +
+              " remaining_updates=" +
+              std::to_string(active_plan_->remaining_updates.load()));
         }
         active_plan = active_plan_;
         if (active_plan != nullptr) {
@@ -302,14 +354,25 @@ class EPLBAsyncRuntime {
     std::lock_guard<std::mutex> lock(mu_);
     idle_cv_.notify_all();
     if (active_plan == nullptr) {
+      async_sync_debug_log("finish_iter no_active_plan");
       return;
     }
     if (active_plan != active_plan_) {
+      async_sync_debug_log(
+          "finish_iter active_plan_replaced step=" +
+          std::to_string(active_plan->target_step));
       return;
     }
     if (active_plan->remaining_updates.load() != 0) {
+      async_sync_debug_log(
+          "finish_iter pending_updates step=" +
+          std::to_string(active_plan->target_step) + " remaining_updates=" +
+          std::to_string(active_plan->remaining_updates.load()));
       return;
     }
+    async_sync_debug_log(
+        "finish_iter clear_active_plan step=" +
+        std::to_string(active_plan->target_step));
     active_plan_.reset();
   }
 
@@ -357,6 +420,9 @@ class EPLBAsyncRuntime {
       const std::shared_ptr<ActivePlan>& active_plan,
       int64_t target_step) {
     if (active_plan == nullptr) {
+      async_sync_debug_log(
+          "enqueue_update_skipped layer_id=" + std::to_string(layer_id) +
+          " reason=no_active_plan");
       return;
     }
     std::lock_guard<std::mutex> lock(mu_);
@@ -365,10 +431,24 @@ class EPLBAsyncRuntime {
       throw std::runtime_error("Unknown async layer id in maybe_start_update.");
     }
     if (!it->second.update_enabled) {
+      async_sync_debug_log(
+          "enqueue_update_skipped layer_id=" + std::to_string(layer_id) +
+          " reason=update_disabled");
+      return;
+    }
+    auto plan_it = active_plan->layer_plans.find(layer_id);
+    if (plan_it == active_plan->layer_plans.end()) {
+      async_sync_debug_log(
+          "enqueue_update_skipped layer_id=" + std::to_string(layer_id) +
+          " reason=not_in_active_plan");
       return;
     }
     ++pending_update_count_;
     it->second.update_inflight = true;
+    async_sync_debug_log(
+        "enqueue_update layer_id=" + std::to_string(layer_id) +
+        " step=" + std::to_string(target_step) + " copy_pairs=" +
+        std::to_string(plan_it->second.dst_slots.size()));
     update_queue_.push_back(UpdateTask{
         .active_plan = active_plan,
         .layer_id = layer_id,
@@ -397,6 +477,9 @@ class EPLBAsyncRuntime {
 
   void wait_cpu_stage(int64_t layer_id, int64_t target_step) {
     RegisteredLayer* layer = get_layer(layer_id);
+    async_sync_debug_log(
+        "wait_cpu_stage_begin layer_id=" + std::to_string(layer_id) +
+        " step=" + std::to_string(target_step));
     int spin_count = 0;
     while (true) {
       if (shutdown_) {
@@ -409,9 +492,15 @@ class EPLBAsyncRuntime {
           sglang::eplb::decode_signal_step(signal_value) == target_step &&
           sglang::eplb::decode_signal_owner(signal_value) ==
               sglang::eplb::kSignalOwnerCpu) {
+        async_sync_debug_log(
+            "wait_cpu_stage_end layer_id=" + std::to_string(layer_id) +
+            " step=" + std::to_string(target_step));
         return;
       }
       if (sglang::eplb::is_signal_disabled(signal_value)) {
+        async_sync_debug_log(
+            "wait_cpu_stage_disabled layer_id=" + std::to_string(layer_id) +
+            " step=" + std::to_string(target_step));
         return;
       }
       ++spin_count;
@@ -432,6 +521,10 @@ class EPLBAsyncRuntime {
       return;
     }
     const LayerPlan& layer_plan = layer_it->second;
+    async_sync_debug_log(
+        "run_update_begin layer_id=" + std::to_string(task.layer_id) +
+        " step=" + std::to_string(task.target_step) + " copy_pairs=" +
+        std::to_string(layer_plan.dst_slots.size()));
     at::cuda::CUDAGuard device_guard(device_index_);
     at::cuda::CUDAStreamGuard stream_guard(
         at::cuda::getStreamFromExternal(copy_stream_, device_index_));
@@ -470,6 +563,10 @@ class EPLBAsyncRuntime {
     for (const auto& reset_spec : task.active_plan->plan.cpu_reset_tensors) {
       reset_spec.tensor.select(reset_spec.layer_dim, task.layer_id).zero_();
     }
+    async_sync_debug_log(
+        "run_update_end layer_id=" + std::to_string(task.layer_id) +
+        " step=" + std::to_string(task.target_step) + " copy_pairs=" +
+        std::to_string(layer_plan.dst_slots.size()));
   }
 
   void cleanup_registered_layers() {

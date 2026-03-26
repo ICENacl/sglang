@@ -234,10 +234,14 @@ class ExpertLocationUpdater:
             return
         assert self._runtime is not None
         if _LOG_ASYNC_SYNC_DEBUG:
+            copy_pairs_per_layer = {
+                layer_id: len(layer_plans[layer_id].copy_pairs) for layer_id in update_layer_ids
+            }
             logger.info(
-                "[EPLBAsyncSync] submit_async_plan update_layers=%s layer_plan_keys=%s",
+                "[EPLBAsyncSync] submit_async_plan update_layers=%s layer_plan_keys=%s copy_pairs_per_layer=%s",
                 list(update_layer_ids),
                 sorted(layer_plans.keys()),
+                copy_pairs_per_layer,
             )
         current_metadata = get_global_expert_location_metadata()
         assert current_metadata is not None
