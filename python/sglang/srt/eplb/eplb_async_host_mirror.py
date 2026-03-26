@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from tqdm.auto import tqdm
 
 from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
@@ -35,6 +36,10 @@ def _get_host_mirror_model_name(model_config) -> str:
 
 def _element_size(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
+
+
+def _format_nbytes(num_bytes: int) -> str:
+    return f"{num_bytes} B ({num_bytes / (1024 * 1024 * 1024):.2f} GB)"
 
 
 def _compute_node_owner_physical_ids(
@@ -118,31 +123,64 @@ class EPLBAsyncHostMirrorManager:
         metadata = get_global_expert_location_metadata()
         assert metadata is not None, "EPLB async host mirror requires expert metadata."
 
-        self._create_records(routed_experts_weights_of_layer)
-        if self._can_reuse_existing_data():
-            logger.info("Reusing existing EPLB async host mirror shared memory data.")
-        else:
-            self._populate_local_node_shards(
-                routed_experts_weights_of_layer=routed_experts_weights_of_layer,
-                metadata=metadata,
-            )
-            self._barrier_all_ranks()
-            self._fill_missing_from_remote_nodes()
-            self._barrier_all_ranks()
-        self._validate_completeness()
+        build_start = time.time()
+        num_layers = len(routed_experts_weights_of_layer)
+        num_tensor_records = sum(
+            len(tensors) for tensors in routed_experts_weights_of_layer.values()
+        )
+        num_local_fill_steps = num_layers * metadata.num_local_physical_experts
+        pbar = tqdm(
+            total=num_layers + num_tensor_records + num_local_fill_steps + num_tensor_records,
+            desc="Building EPLB async host mirror",
+            disable=self._rank != 0,
+            dynamic_ncols=True,
+        )
+        reused_existing_data = False
+        remote_transfer_count = 0
 
-        for layer_id, tensors in routed_experts_weights_of_layer.items():
-            attached = []
-            for tensor_index, _ in enumerate(tensors):
-                record = self._records.get((layer_id, tensor_index))
-                if record is None:
-                    raise RuntimeError(
-                        f"EPLB async host mirror is incomplete for layer={layer_id} tensor_index={tensor_index}."
-                    )
-                attached.append(record.tensor)
-            self._layer_tensors[layer_id] = attached
+        try:
+            self._create_records(routed_experts_weights_of_layer, pbar=pbar)
+            reused_existing_data = self._can_reuse_existing_data()
+            if reused_existing_data:
+                pbar.update(num_local_fill_steps)
+            else:
+                self._populate_local_node_shards(
+                    routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+                    metadata=metadata,
+                    pbar=pbar,
+                )
+                self._barrier_all_ranks()
+                remote_transfer_count = self._fill_missing_from_remote_nodes(pbar=pbar)
+                self._barrier_all_ranks()
+            self._validate_completeness()
+
+            for layer_id, tensors in routed_experts_weights_of_layer.items():
+                attached = []
+                for tensor_index, _ in enumerate(tensors):
+                    record = self._records.get((layer_id, tensor_index))
+                    if record is None:
+                        raise RuntimeError(
+                            f"EPLB async host mirror is incomplete for layer={layer_id} tensor_index={tensor_index}."
+                        )
+                    attached.append(record.tensor)
+                    pbar.update(1)
+                self._layer_tensors[layer_id] = attached
+        finally:
+            pbar.close()
 
         self._maybe_register_atexit()
+        if self._rank == 0:
+            shm_nbytes = self._get_total_shm_nbytes()
+            logger.info(
+                "EPLB async host mirror build complete: reused_existing_data=%s "
+                "layers=%s tensor_records=%s remote_transfers=%s shm=%s elapsed=%.2fs",
+                reused_existing_data,
+                num_layers,
+                num_tensor_records,
+                remote_transfer_count,
+                _format_nbytes(shm_nbytes),
+                time.time() - build_start,
+            )
 
     def get_expert_tensors(self, layer_id: int, logical_expert_id: int):
         if layer_id not in self._layer_tensors:
@@ -188,18 +226,22 @@ class EPLBAsyncHostMirrorManager:
         self._registered_atexit = True
         atexit.register(self.close)
 
-    def _create_records(self, routed_experts_weights_of_layer) -> None:
+    def _create_records(self, routed_experts_weights_of_layer, pbar=None) -> None:
         for layer_id, tensors in routed_experts_weights_of_layer.items():
             self._layer_num_tensors[layer_id] = len(tensors)
         if self._is_owner:
             for layer_id, tensors in routed_experts_weights_of_layer.items():
                 self._get_or_create_valid_tensor(layer_id)
+                if pbar is not None:
+                    pbar.update(1)
                 for tensor_index, tensor in enumerate(tensors):
                     self._get_or_create_tensor(
                         layer_id=layer_id,
                         tensor_index=tensor_index,
                         sample_tensor=tensor,
                     )
+                    if pbar is not None:
+                        pbar.update(1)
         self._barrier_all_ranks()
         if not self._is_owner:
             for layer_id, tensors in routed_experts_weights_of_layer.items():
@@ -212,7 +254,9 @@ class EPLBAsyncHostMirrorManager:
                     )
         self._barrier_all_ranks()
 
-    def _populate_local_node_shards(self, *, routed_experts_weights_of_layer, metadata) -> None:
+    def _populate_local_node_shards(
+        self, *, routed_experts_weights_of_layer, metadata, pbar=None
+    ) -> None:
         num_local_physical_experts = metadata.num_local_physical_experts
         local_physical_start = self._rank * num_local_physical_experts
         node_physical_start = self._node_rank * self._local_world_size * num_local_physical_experts
@@ -241,19 +285,31 @@ class EPLBAsyncHostMirrorManager:
                     record = self._records[(layer_id, tensor_index)]
                     record.tensor[logical_expert_id].copy_(tensor[local_expert_id].cpu())
                 valid_tensor[logical_expert_id] = 1
+                if pbar is not None:
+                    pbar.update(1)
 
-    def _fill_missing_from_remote_nodes(self) -> None:
+    def _fill_missing_from_remote_nodes(self, pbar=None) -> int:
         if self._leader_cpu_group is None:
-            return
+            return 0
         if not self._is_owner:
-            return
+            return 0
 
+        local_transfer_count = 0
         for layer_id in sorted(self._valid_records):
             local_bitmap = self._valid_records[layer_id].tensor.clone()
             gathered = [torch.empty_like(local_bitmap) for _ in range(self._num_nodes)]
             dist.all_gather(gathered, local_bitmap, group=self._leader_cpu_group)
             availability = torch.stack(gathered, dim=0)
             transfer_plan = _build_cross_node_transfer_plan(availability)
+            local_layer_transfer_count = sum(
+                1
+                for _, src_node_rank, dst_node_rank in transfer_plan
+                if self._node_rank in (src_node_rank, dst_node_rank)
+            )
+            local_transfer_count += local_layer_transfer_count
+            if pbar is not None and local_layer_transfer_count > 0:
+                pbar.total += local_layer_transfer_count
+                pbar.refresh()
             if len(transfer_plan) == 0:
                 continue
 
@@ -266,8 +322,11 @@ class EPLBAsyncHostMirrorManager:
                     src_node_rank=src_node_rank,
                     dst_node_rank=dst_node_rank,
                 )
+                if pbar is not None:
+                    pbar.update(1)
 
             dist.barrier(group=self._leader_cpu_group)
+        return local_transfer_count
 
     def _transfer_logical_expert(
         self,
@@ -441,7 +500,7 @@ class EPLBAsyncHostMirrorManager:
             return shm, True, not self._reuse_existing_shm, True
         except FileExistsError:
             if self._reuse_existing_shm:
-                logger.info(
+                logger.debug(
                     "Reusing existing EPLB async shared memory name: %s",
                     shm_name,
                 )
@@ -476,6 +535,14 @@ class EPLBAsyncHostMirrorManager:
             if not torch.all(valid_record.tensor == 1):
                 return False
         return True
+
+    def _get_total_shm_nbytes(self) -> int:
+        total = 0
+        for record in self._records.values():
+            total += getattr(record.shm, "size", 0)
+        for record in self._valid_records.values():
+            total += getattr(record.shm, "size", 0)
+        return total
 
 
 def _create_buffer_tensor(
