@@ -31,7 +31,6 @@ import torch.distributed
 from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_int_env_var
@@ -120,9 +119,6 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def on_select_experts_logical(self, topk_ids: torch.Tensor):
-        pass
-
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -188,12 +184,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._current_skip_rebalance_window = Withable()
+        self._enable_async_eplb = server_args.enable_eplb_async
         self._skip_next_forward_pass = False
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
-        self._enable_async_eplb = server_args.enable_eplb_async
         self._metric_source = self._compute_metric_source()
         self._metric_global_physical_count = (
             torch.zeros(
@@ -207,21 +202,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             if server_args.enable_expert_distribution_metrics
             else None
         )
-        self._async_logical_count = (
-            torch.zeros(
-                (
-                    expert_location_metadata.num_layers,
-                    expert_location_metadata.num_logical_experts,
-                ),
-                dtype=torch.int32,
-                device=server_args.device,
-            )
-            if self._enable_async_eplb
-            else None
-        )
-        self._async_logical_count_snapshot = None
-        self._async_logical_count_snapshot_event = None
-        self._async_logical_count_snapshot_pending = False
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -240,6 +220,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._current_debug_name.with_value(debug_name)
 
     def _compute_metric_source(self) -> Optional[str]:
+        if not self._enable_async_eplb:
+            return None
         if not self._server_args.enable_expert_distribution_metrics:
             return None
         if self._server_args.moe_a2a_backend == "none":
@@ -253,11 +235,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
-        skip_rebalance_window = self._skip_next_forward_pass
-        self._skip_next_forward_pass = False
-        with self._current_forward_pass_id.with_value(
-            forward_pass_id
-        ), self._current_skip_rebalance_window.with_value(skip_rebalance_window):
+        skip_rebalance_window = False
+        if self._enable_async_eplb:
+            skip_rebalance_window = self._skip_next_forward_pass
+            self._skip_next_forward_pass = False
+        with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:
                 yield outputs
@@ -297,7 +279,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            if self._metric_global_physical_count is not None:
+            if self._enable_async_eplb and self._metric_global_physical_count is not None:
                 single_pass_data["metric_global_physical_count"] = (
                     self._metric_global_physical_count
                 )
@@ -310,15 +292,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
-        self._append_metric_from_topk_ids(topk_ids)
+        if self._enable_async_eplb:
+            self._append_metric_from_topk_ids(topk_ids)
         self._on_hook("on_select_experts", topk_ids=topk_ids)
-
-    def on_select_experts_logical(self, topk_ids: torch.Tensor):
-        if not self._enable_async_eplb:
-            return
-        if self._server_args.moe_a2a_backend != "none":
-            return
-        self._on_async_logical_hook("_on_select_experts_logical", topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(
         self,
@@ -327,14 +303,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
-        self._append_metric_from_local_physical_count_list(local_physical_count_of_layer)
         if self._enable_async_eplb:
-            self._on_async_logical_hook(
-                "_on_deepep_dispatch_normal_async",
-                local_physical_count_of_layer=local_physical_count_of_layer,
-                num_tokens_per_rank=num_tokens_per_rank,
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
+            self._append_metric_from_local_physical_count_list(
+                local_physical_count_of_layer
             )
         self._on_hook(
             "on_deepep_dispatch_normal",
@@ -347,11 +318,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
-        self._append_metric_from_local_physical_count_tensor(local_physical_count_of_layer)
         if self._enable_async_eplb:
-            self._on_async_logical_hook(
-                "_on_deepep_dispatch_low_latency_async",
-                local_physical_count_of_layer=local_physical_count_of_layer,
+            self._append_metric_from_local_physical_count_tensor(
+                local_physical_count_of_layer
             )
         self._on_hook(
             "on_deepep_dispatch_low_latency",
@@ -361,9 +330,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if not self._recording:
-            return
-        if self._current_forward_pass_id.value is None:
+        if self._enable_async_eplb:
+            if not self._recording:
+                return
+            if self._current_forward_pass_id.value is None:
+                return
+        elif not (
+            self._recording or torch.get_device_module().is_current_stream_capturing()
+        ):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -371,19 +345,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         ]
         getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
-
-    def _on_async_logical_hook(self, hook_name: str, **kwargs):
-        if self._disable_all:
-            return
-        if not self._recording:
-            return
-        if self._current_forward_pass_id.value is None:
-            return
-        if self._current_layer_idx.value is None:
-            return
-        if self._current_skip_rebalance_window.value:
-            return
-        getattr(self, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
@@ -396,11 +357,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._accumulator.reset()
         if self._metric_global_physical_count is not None:
             self._metric_global_physical_count.zero_()
-        if self._async_logical_count is not None:
-            self._async_logical_count.zero_()
-        self._async_logical_count_snapshot = None
-        self._async_logical_count_snapshot_event = None
-        self._async_logical_count_snapshot_pending = False
 
     def _append_metric_from_topk_ids(self, topk_ids: torch.Tensor):
         if self._metric_global_physical_count is None:
@@ -471,68 +427,23 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        if self._enable_async_eplb and output_mode == "object":
-            logical_count = self._async_logical_count_snapshot
-            if logical_count is None:
-                logical_count = self._async_logical_count.unsqueeze(0).clone()
-            reduce_group = _get_eplb_reduce_group()
-            if reduce_group is not None:
-                torch.distributed.all_reduce(
-                    logical_count,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=reduce_group,
-                )
-            output = dict(
-                logical_count=logical_count,
-                average_utilization_rate_over_window=(
-                    self._accumulator._get_global_average_utilization_rate()
-                    if hasattr(self._accumulator, "_get_global_average_utilization_rate")
-                    else None
-                ),
-            )
-        else:
-            output = self._accumulator.dump(output_mode=output_mode)
+        output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
 
     def skip_next_forward_pass(self):
-        if self._async_logical_count is not None:
-            if self._async_logical_count.is_cuda:
-                self._async_logical_count_snapshot_event = torch.cuda.Event(
-                    enable_timing=False
-                )
-                self._async_logical_count_snapshot_event.record(
-                    torch.cuda.current_stream(
-                        device=self._async_logical_count.device
-                    )
-                )
-                self._async_logical_count_snapshot_pending = True
-            else:
-                self._async_logical_count_snapshot = (
-                    self._async_logical_count.unsqueeze(0).clone()
-                )
-                self._async_logical_count_snapshot_pending = False
+        if not self._enable_async_eplb:
+            return
         self._skip_next_forward_pass = True
 
     def materialize_async_snapshot(self):
-        if not self._async_logical_count_snapshot_pending:
-            return
-        if self._async_logical_count_snapshot_event is not None:
-            torch.cuda.current_stream(
-                device=self._async_logical_count.device
-            ).wait_event(self._async_logical_count_snapshot_event)
-            self._async_logical_count_snapshot_event = None
-        self._async_logical_count_snapshot = (
-            self._async_logical_count.unsqueeze(0).clone()
-        )
-        self._async_logical_count_snapshot_pending = False
+        return
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
-        if self._async_logical_count is None:
+        if not self._enable_async_eplb:
             return
         if len(layer_ids) == 0:
             return
-        self._async_logical_count[layer_ids, :] = 0
         if (
             hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
             and self._accumulator._global_physical_count_of_buffered_step is not None
@@ -542,9 +453,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             ] = 0
 
     def get_async_runtime_reset_tensor_specs(self) -> List[Tuple[torch.Tensor, int]]:
+        if not self._enable_async_eplb:
+            return []
         specs: List[Tuple[torch.Tensor, int]] = []
-        if self._async_logical_count is not None:
-            specs.append((self._async_logical_count, 0))
         if (
             hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
             and self._accumulator._global_physical_count_of_buffered_step is not None
@@ -556,67 +467,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 )
             )
         return specs
-
-    def _on_select_experts_logical(self, layer_idx: int, topk_ids: torch.Tensor):
-        logical_count = _convert_per_token_to_logical_count(
-            num_tokens=topk_ids.shape[0],
-            num_layers=1,
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            topk_ids_of_layer=topk_ids.unsqueeze(0),
-        )[0]
-        self._async_logical_count[layer_idx, :] += logical_count
-
-    def _on_deepep_dispatch_normal_async(
-        self,
-        layer_idx: int,
-        local_physical_count_of_layer: List[int],
-        num_tokens_per_rank,
-        num_tokens_per_rdma_rank,
-        num_tokens_per_expert,
-    ):
-        local_physical_count_tensor = torch.tensor(
-            local_physical_count_of_layer,
-            dtype=torch.int32,
-            device=self._server_args.device,
-        )
-        global_physical_count = _convert_local_to_global_physical_count(
-            local_physical_count_tensor.unsqueeze(0),
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )[0]
-        self._async_append_global_physical_count(layer_idx, global_physical_count)
-
-    def _on_deepep_dispatch_low_latency_async(
-        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
-    ):
-        global_physical_count = _convert_local_to_global_physical_count(
-            local_physical_count_of_layer.unsqueeze(0),
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )[0]
-        self._async_append_global_physical_count(layer_idx, global_physical_count)
-
-    def _async_append_global_physical_count(
-        self, layer_idx: int, global_physical_count: torch.Tensor
-    ):
-        current_metadata = get_global_expert_location_metadata()
-        assert current_metadata is not None
-        physical_to_logical_map = current_metadata.get_physical_to_logical_map_layer(
-            layer_idx
-        )
-        logical_count = torch.zeros(
-            (self._expert_location_metadata.num_logical_experts,),
-            dtype=global_physical_count.dtype,
-            device=global_physical_count.device,
-        )
-        logical_count.scatter_add_(
-            dim=0,
-            index=physical_to_logical_map.to(torch.int64),
-            src=global_physical_count,
-        )
-        self._async_logical_count[layer_idx, :] += logical_count
 
     @property
     def recording(self):
@@ -930,25 +780,6 @@ def _convert_per_token_to_global_physical_count(
     return ans
 
 
-def _convert_per_token_to_logical_count(
-    num_tokens: int,
-    num_layers: int,
-    num_logical_experts: int,
-    topk_ids_of_layer: torch.Tensor,
-) -> torch.Tensor:
-    topk_ids_layer_major = topk_ids_of_layer[:, :num_tokens, :].reshape(num_layers, -1)
-    mask = (topk_ids_layer_major >= 0) & (topk_ids_layer_major < num_logical_experts)
-    index = topk_ids_layer_major.masked_fill(~mask, 0).long()
-    src = mask.int()
-    ans = torch.zeros(
-        (num_layers, num_logical_experts),
-        dtype=topk_ids_of_layer.dtype,
-        device=topk_ids_of_layer.device,
-    )
-    ans.scatter_add_(dim=1, index=index, src=src)
-    return ans
-
-
 def _convert_local_to_global_physical_count(
     local_physical_count: torch.Tensor,
     rank: int,
@@ -1055,12 +886,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             include_in_rebalance_window,
         )
         if self._enable:
+            utilization_rate_source = single_pass_data["global_physical_count"]
+            if self._server_args.enable_eplb_async:
+                utilization_rate_source = single_pass_data.get(
+                    "metric_global_physical_count",
+                    utilization_rate_source,
+                )
             return self._append_utilization_rate(
                 forward_pass_id,
-                single_pass_data.get(
-                    "metric_global_physical_count",
-                    single_pass_data["global_physical_count"],
-                ),
+                utilization_rate_source,
                 outputs,
                 include_in_rebalance_window,
             )
@@ -1082,11 +916,22 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
-        torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
-        )
+        if self._server_args.enable_eplb_async:
+            eplb_group = _get_eplb_group()
+            if eplb_group is not None:
+                torch.distributed.all_reduce(
+                    gpu_physical_count,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=eplb_group.device_group,
+                )
+            should_report = eplb_group is None or eplb_group.rank_in_group == 0
+        else:
+            torch.distributed.reduce(
+                gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            )
+            should_report = self._rank == 0
 
-        if self._rank == 0:
+        if should_report:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
@@ -1100,7 +945,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
-                if include_in_rebalance_window:
+                if self._server_args.enable_eplb_async:
+                    if include_in_rebalance_window:
+                        self._history.append(utilization_rate_cpu)
+                else:
                     self._history.append(utilization_rate_cpu)
 
                 gpu_physical_count_sum = gpu_physical_count.sum().item()
@@ -1190,7 +1038,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
                 return obj.cpu().clone()
             return obj
 
-        if not include_in_rebalance_window:
+        if self._server_args.enable_eplb_async and not include_in_rebalance_window:
             return
 
         single_pass_data_processed = {
@@ -1252,7 +1100,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             outputs,
             include_in_rebalance_window,
         )
-        if not include_in_rebalance_window:
+        if self._server_args.enable_eplb_async and not include_in_rebalance_window:
             return
         # Can optimize if overhead here is large
         self._global_physical_count_of_buffered_step.append(
@@ -1275,12 +1123,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        reduce_group = _get_eplb_reduce_group()
-        if reduce_group is not None:
+        if self._server_args.enable_eplb_async:
+            reduce_group = _get_eplb_reduce_group()
+            if reduce_group is not None:
+                torch.distributed.all_reduce(
+                    logical_count_of_buffered_step,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=reduce_group,
+                )
+        else:
             torch.distributed.all_reduce(
-                logical_count_of_buffered_step,
-                op=torch.distributed.ReduceOp.SUM,
-                group=reduce_group,
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
             )
 
         output = dict(
@@ -1303,12 +1156,23 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        eplb_group = _get_eplb_group()
-        if eplb_group is None:
-            return None
+        if self._server_args.enable_eplb_async:
+            eplb_group = _get_eplb_group()
+            if eplb_group is None:
+                return None
 
-        average_utilization_rate_over_window = None
-        if eplb_group.rank_in_group == 0:
+            average_utilization_rate_over_window = None
+            if eplb_group.rank_in_group == 0:
+                utilization_mean_rates = self._history.mean()
+                window_index = self.window_sizes[-1]
+                average_utilization_rate_over_window = (
+                    utilization_mean_rates[window_index]
+                    if window_index in utilization_mean_rates
+                    else 0
+                )
+            return _broadcast_eplb_host_scalar(average_utilization_rate_over_window)
+
+        if self._rank == 0:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1316,7 +1180,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 if window_index in utilization_mean_rates
                 else 0
             )
-        return _broadcast_eplb_host_scalar(average_utilization_rate_over_window)
+            avg_rate_tensor = torch.tensor(
+                [average_utilization_rate_over_window],
+                dtype=torch.float32,
+                device=self._server_args.device,
+            )
+        else:
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=self._server_args.device
+            )
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        return avg_rate_tensor.item()
 
 
 def _dump_to_file(name, data):
