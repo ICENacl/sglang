@@ -169,6 +169,7 @@ class EPLBAsyncHostMirrorManager:
         self._records: dict[tuple[int, int], _ShmRecord] = {}
         self._valid_records: dict[int, _ShmRecord] = {}
         self._layer_tensors: dict[int, list[torch.Tensor]] = {}
+        self._dummy_layer_tensors: dict[int, list[torch.Tensor]] = {}
         self._layer_num_tensors: dict[int, int] = {}
         self._gpu_staging_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._cpu_transfer_buffers: dict[tuple[int, int], torch.Tensor] = {}
@@ -179,6 +180,7 @@ class EPLBAsyncHostMirrorManager:
         self._registered_atexit = False
         self._lock = threading.Lock()
         self._reuse_existing_shm = envs.SGLANG_EPLB_ASYNC_HOST_MIRROR_REUSE_SHM.get()
+        self._dummy_h2d = envs.SGLANG_EPLB_ASYNC_DUMMY_H2D.get()
 
         model_name = _sanitize_name(_get_host_mirror_model_name(model_config))
         master_port = _sanitize_name(os.environ.get("MASTER_PORT", "0"))
@@ -188,6 +190,10 @@ class EPLBAsyncHostMirrorManager:
         self._maybe_create_leader_groups()
 
     def build_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
+        if self._dummy_h2d:
+            self._build_dummy_from_loaded_model(routed_experts_weights_of_layer)
+            return
+
         metadata = get_global_expert_location_metadata()
         assert metadata is not None, "EPLB async host mirror requires expert metadata."
 
@@ -295,6 +301,12 @@ class EPLBAsyncHostMirrorManager:
             )
 
     def get_expert_tensors(self, layer_id: int, logical_expert_id: int):
+        if self._dummy_h2d:
+            if layer_id not in self._dummy_layer_tensors:
+                raise KeyError(
+                    f"Layer {layer_id} does not exist in async dummy host mirror."
+                )
+            return self._dummy_layer_tensors[layer_id]
         if layer_id not in self._layer_tensors:
             raise KeyError(f"Layer {layer_id} does not exist in async host mirror.")
         return [tensor[logical_expert_id] for tensor in self._layer_tensors[layer_id]]
@@ -327,11 +339,33 @@ class EPLBAsyncHostMirrorManager:
         self._records.clear()
         self._valid_records.clear()
         self._layer_tensors.clear()
+        self._dummy_layer_tensors.clear()
         self._layer_num_tensors.clear()
         self._gpu_staging_buffers.clear()
         self._cpu_transfer_buffers.clear()
         self._leader_device_group = None
         self._leader_cpu_group = None
+
+    def _build_dummy_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
+        self._dummy_layer_tensors.clear()
+        self._layer_num_tensors.clear()
+
+        for layer_id, tensors in routed_experts_weights_of_layer.items():
+            self._layer_num_tensors[layer_id] = len(tensors)
+            fake_tensors = []
+            for tensor in tensors:
+                fake = torch.empty_like(tensor[0], device="cpu", pin_memory=True)
+                fake.zero_()
+                fake_tensors.append(fake)
+            self._dummy_layer_tensors[layer_id] = fake_tensors
+
+        self._maybe_register_atexit()
+        if self._rank == 0:
+            logger.info(
+                "EPLB async dummy H2D enabled: skipped host mirror build, layers=%s tensor_records=%s",
+                len(routed_experts_weights_of_layer),
+                sum(len(tensors) for tensors in routed_experts_weights_of_layer.values()),
+            )
 
     def _maybe_register_atexit(self):
         if self._registered_atexit:
