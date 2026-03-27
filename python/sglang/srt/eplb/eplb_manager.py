@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
-from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.eplb.expert_distribution import (
     AsyncRebalanceSnapshot,
     _convert_global_physical_count_to_logical_count,
@@ -347,29 +346,7 @@ class EPLBManager:
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 
     def _should_use_post_launch_async_prepare(self) -> bool:
-        if not self._server_args.enable_eplb_async:
-            return False
-        if self._server_args.expert_distribution_recorder_mode not in [
-            "stat",
-            "stat_approx",
-        ]:
-            return False
-
-        common = ExpertLocationMetadata._init_common(
-            self._server_args, self._model_runner.model_config
-        )
-        if common is None:
-            return False
-
-        algorithm = eplb_algorithms.compute_algorithm(
-            raw_algorithm=self._server_args.eplb_algorithm,
-            num_groups=common["model_config_for_expert_location"].num_groups,
-            num_nodes=self._server_args.nnodes,
-        )
-        return algorithm in [
-            eplb_algorithms.EplbAlgorithm.deepseek,
-            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
-        ]
+        return False
 
 
 def _chunk_list(items: List, chunk_size):
