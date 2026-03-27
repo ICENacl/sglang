@@ -239,11 +239,24 @@ class EPLBManager:
         self._prepared_rebalance_target_forward_pass_id = target_forward_pass_id
 
     def _finish_async_rebalance_prepare(self, logical_count_snapshot):
-        logical_count, ready_event, average_utilization_rate_over_window = (
+        (
+            global_physical_count,
+            physical_to_logical_map,
+            num_logical_experts,
+            ready_event,
+            average_utilization_rate_over_window,
+        ) = (
             logical_count_snapshot
         )
         if ready_event is not None:
             ready_event.synchronize()
+
+        logical_count = _convert_global_physical_count_to_logical_count(
+            global_physical_count=global_physical_count,
+            num_layers=global_physical_count.shape[1],
+            num_logical_experts=num_logical_experts,
+            physical_to_logical_map=physical_to_logical_map,
+        )
 
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
             return None
@@ -259,42 +272,43 @@ class EPLBManager:
         global_physical_count = (
             get_global_expert_distribution_recorder().detach_async_rebalance_global_physical_count()
         )
+        physical_to_logical_map = (
+            get_global_expert_distribution_recorder().detach_async_rebalance_physical_to_logical_map()
+        )
         if global_physical_count is None:
             raise RuntimeError("Missing async rebalance global physical count buffer.")
+        if physical_to_logical_map is None:
+            raise RuntimeError("Missing async rebalance physical_to_logical_map buffer.")
 
         if global_physical_count.is_cuda:
             assert self._prepare_stream is not None
+            global_physical_count_cpu = torch.empty(
+                global_physical_count.shape,
+                dtype=global_physical_count.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
             with torch.cuda.stream(self._prepare_stream):
                 if snapshot.ready_event is not None:
                     self._prepare_stream.wait_event(snapshot.ready_event)
-                logical_count = _convert_global_physical_count_to_logical_count(
-                    global_physical_count=global_physical_count,
-                    num_layers=snapshot.physical_to_logical_map.shape[0],
-                    num_logical_experts=snapshot.num_logical_experts,
-                    physical_to_logical_map=snapshot.physical_to_logical_map,
-                )
-                logical_count_cpu = torch.empty(
-                    logical_count.shape,
-                    dtype=logical_count.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                logical_count_cpu.copy_(logical_count, non_blocking=True)
+                global_physical_count_cpu.copy_(global_physical_count, non_blocking=True)
                 ready_event = torch.cuda.Event()
                 ready_event.record(self._prepare_stream)
             return (
-                logical_count_cpu,
+                global_physical_count_cpu,
+                physical_to_logical_map,
+                snapshot.num_logical_experts,
                 ready_event,
                 snapshot.average_utilization_rate_over_window,
             )
 
-        logical_count = _convert_global_physical_count_to_logical_count(
-            global_physical_count=global_physical_count,
-            num_layers=snapshot.physical_to_logical_map.shape[0],
-            num_logical_experts=snapshot.num_logical_experts,
-            physical_to_logical_map=snapshot.physical_to_logical_map,
+        return (
+            global_physical_count,
+            physical_to_logical_map,
+            snapshot.num_logical_experts,
+            None,
+            snapshot.average_utilization_rate_over_window,
         )
-        return (logical_count, None, snapshot.average_utilization_rate_over_window)
 
     def _apply_prepared_async_rebalance(self):
         if self._prepared_rebalance_metadata is None:

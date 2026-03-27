@@ -233,18 +233,29 @@ class ExpertLocationUpdater:
         if not self._enable_async or not torch.cuda.is_available():
             return
         assert self._runtime is not None
+        current_metadata = get_global_expert_location_metadata()
+        assert current_metadata is not None
         if _LOG_ASYNC_SYNC_DEBUG:
             copy_pairs_per_layer = {
-                layer_id: len(layer_plans[layer_id].copy_pairs) for layer_id in update_layer_ids
+                layer_id: len(layer_plans[layer_id].copy_pairs)
+                for layer_id in update_layer_ids
+            }
+            metadata_equal_per_layer = {
+                layer_id: bool(
+                    torch.equal(
+                        current_metadata.physical_to_logical_map_cpu[layer_id],
+                        new_expert_location_metadata.physical_to_logical_map_cpu[layer_id],
+                    )
+                )
+                for layer_id in update_layer_ids
             }
             logger.info(
-                "[EPLBAsyncSync] submit_async_plan update_layers=%s layer_plan_keys=%s copy_pairs_per_layer=%s",
+                "[EPLBAsyncSync] submit_async_plan update_layers=%s layer_plan_keys=%s copy_pairs_per_layer=%s metadata_equal_per_layer=%s",
                 list(update_layer_ids),
                 sorted(layer_plans.keys()),
                 copy_pairs_per_layer,
+                metadata_equal_per_layer,
             )
-        current_metadata = get_global_expert_location_metadata()
-        assert current_metadata is not None
         cpp_layer_plans = []
         for layer_id in update_layer_ids:
             if layer_id not in layer_plans:

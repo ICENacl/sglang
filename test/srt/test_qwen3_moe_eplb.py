@@ -1,7 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.eplb.expert_distribution import (
+    _convert_global_physical_count_to_logical_count,
+)
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.utils import LazyValue
 
@@ -106,3 +111,38 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
     assert manager._prepared_update_layer_ids_chunks == [[2], [4]]
     assert manager._prepared_rebalance_target_forward_pass_id == 4
     manager._apply_prepared_async_rebalance.assert_called_once()
+
+
+def test_async_logical_count_uses_per_step_mapping():
+    global_physical_count = torch.tensor(
+        [
+            [[3, 5]],
+            [[3, 5]],
+        ],
+        dtype=torch.int32,
+    )
+    physical_to_logical_map = torch.tensor(
+        [
+            [[0, 1]],
+            [[1, 0]],
+        ],
+        dtype=torch.int32,
+    )
+
+    logical_count = _convert_global_physical_count_to_logical_count(
+        global_physical_count=global_physical_count,
+        num_layers=1,
+        num_logical_experts=2,
+        physical_to_logical_map=physical_to_logical_map,
+    )
+
+    assert torch.equal(
+        logical_count,
+        torch.tensor(
+            [
+                [[3, 5]],
+                [[5, 3]],
+            ],
+            dtype=torch.int32,
+        ),
+    )

@@ -13,6 +13,7 @@ from torch.multiprocessing import Process
 from sglang.srt.eplb import expert_location_updater
 from sglang.srt.eplb.cpp_async_runtime import create_eplb_async_runtime
 from sglang.srt.eplb.eplb_async_host_mirror import (
+    EPLBAsyncHostMirrorManager,
     _build_node_availability_from_metadata,
     _build_cross_node_transfer_plan,
     _compute_local_owner_indices,
@@ -329,6 +330,29 @@ class TestExpertLocationUpdater(CustomTestCase):
         self.assertTrue(
             torch.equal(logical_expert_ids, torch.tensor([3, 4], dtype=torch.int64))
         )
+
+    def test_async_host_mirror_dummy_h2d_returns_fake_tensors(self):
+        manager = EPLBAsyncHostMirrorManager.__new__(EPLBAsyncHostMirrorManager)
+        manager._dummy_h2d = True
+        manager._dummy_layer_tensors = {}
+        manager._layer_num_tensors = {}
+        manager._rank = 0
+        manager._registered_atexit = True
+        manager._maybe_register_atexit = lambda: None
+
+        routed_experts_weights_of_layer = {
+            3: [
+                torch.tensor([[1, 2], [3, 4]], dtype=torch.float32),
+                torch.tensor([[5], [6]], dtype=torch.float32),
+            ]
+        }
+
+        manager._build_dummy_from_loaded_model(routed_experts_weights_of_layer)
+        fake_tensors = manager.get_expert_tensors(3, 1)
+
+        self.assertEqual(len(fake_tensors), 2)
+        self.assertTrue(torch.equal(fake_tensors[0], torch.zeros((2,), dtype=torch.float32)))
+        self.assertTrue(torch.equal(fake_tensors[1], torch.zeros((1,), dtype=torch.float32)))
 
     def _test_common(self, device):
         infos = []
