@@ -206,6 +206,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             server_args, expert_location_metadata, rank
         )
         self._async_physical_count_source = self._compute_async_physical_count_source()
+        metadata_device = expert_location_metadata.physical_to_logical_map.device
         self._async_global_physical_count = (
             torch.zeros(
                 (
@@ -213,7 +214,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                     expert_location_metadata.num_physical_experts,
                 ),
                 dtype=torch.int32,
-                device=server_args.device,
+                device=metadata_device,
             )
             if self._enable_async_eplb
             else None
@@ -226,7 +227,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                     expert_location_metadata.num_physical_experts,
                 ),
                 dtype=torch.int32,
-                device=server_args.device,
+                device=metadata_device,
             )
             if server_args.enable_expert_distribution_metrics
             else None
@@ -455,7 +456,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         local_physical_count_tensor = torch.tensor(
             local_physical_count_of_layer,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=self._async_global_physical_count.device,
         )
         self._append_async_from_local_physical_count_tensor(
             local_physical_count_tensor
@@ -505,7 +506,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         local_physical_count_tensor = torch.tensor(
             local_physical_count_of_layer,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=self._metric_global_physical_count.device,
         )
         self._append_metric_from_local_physical_count_tensor(
             local_physical_count_tensor
@@ -729,7 +730,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 self._TOP_K_NUM,
             ),
             dtype=torch.int32,
-            device=server_args.device,
+            device=expert_location_metadata.physical_to_logical_map.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
@@ -1070,7 +1071,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
-        gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        gpu_physical_count = gpu_physical_count.to(
+            self._expert_location_metadata.physical_to_logical_map.device
+        )
         if self._server_args.enable_eplb_async:
             eplb_group = _get_eplb_group()
             if eplb_group is not None:
@@ -1236,7 +1239,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             ),
             buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
-            device=self._server_args.device,
+            device=self._expert_location_metadata.physical_to_logical_map.device,
         )
         self._physical_to_logical_map_of_buffered_step = (
             _Buffer.init_new(
@@ -1381,11 +1384,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=self._server_args.device,
+                device=self._expert_location_metadata.physical_to_logical_map.device,
             )
         else:
             avg_rate_tensor = torch.empty(
-                1, dtype=torch.float32, device=self._server_args.device
+                1,
+                dtype=torch.float32,
+                device=self._expert_location_metadata.physical_to_logical_map.device,
             )
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()

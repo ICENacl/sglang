@@ -39,6 +39,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_current_device_for_runtime(device_like) -> torch.device:
+    current_metadata = get_global_expert_location_metadata()
+    if current_metadata is not None and current_metadata.physical_to_logical_map.is_cuda:
+        return current_metadata.physical_to_logical_map.device
+    device = torch.device(device_like)
+    if device.type == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def _copy_to_device_if_needed(tensor: torch.Tensor, device: str) -> torch.Tensor:
     if str(tensor.device) == device:
         return tensor
@@ -130,7 +140,14 @@ class ExpertLocationMetadata:
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
-        physical_to_logical_map = physical_to_logical_map.to(server_args.device)
+        target_device = (
+            physical_to_logical_map.device
+            if physical_to_logical_map.is_cuda
+            else _get_current_device_for_runtime(server_args.device)
+        )
+        physical_to_logical_map = physical_to_logical_map.to(
+            target_device
+        )
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -186,7 +203,14 @@ class ExpertLocationMetadata:
             if torch.cuda.is_available() and not logical_count.is_pinned():
                 logical_count = logical_count.pin_memory()
         else:
-            logical_count = logical_count.to(server_args.device)
+            target_device = (
+                logical_count.device
+                if logical_count.is_cuda
+                else _get_current_device_for_runtime(server_args.device)
+            )
+            logical_count = logical_count.to(
+                target_device
+            )
 
         try:
             if use_async_deepseek_cpp:
@@ -285,7 +309,10 @@ class ExpertLocationMetadata:
             cpu_tensor.copy_(tensor, non_blocking=True)
             return cpu_tensor
 
-        target_device = server_args.device
+        if physical_to_logical_map.is_cuda:
+            target_device = physical_to_logical_map.device
+        else:
+            target_device = _get_current_device_for_runtime(server_args.device)
         physical_to_logical_map_cpu = _to_pinned_cpu_tensor(physical_to_logical_map)
         logical_to_all_physical_map_cpu = _to_pinned_cpu_tensor(
             logical_to_all_physical_map
