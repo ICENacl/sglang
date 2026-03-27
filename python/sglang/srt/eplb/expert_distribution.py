@@ -1249,6 +1249,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
                 dtype=self._expert_location_metadata.physical_to_logical_map_cpu.dtype,
                 device="cpu",
+                pin_memory=True,
             )
             if self._server_args.enable_eplb_async
             else None
@@ -1407,11 +1408,21 @@ def _dump_to_file(name, data):
 
 class _Buffer:
     @staticmethod
-    def init_new(item_shape: Tuple, buffer_size: int, dtype, device):
+    def init_new(
+        item_shape: Tuple, buffer_size: int, dtype, device, pin_memory: bool = False
+    ):
         if buffer_size < 0:
-            return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
+            return _InfiniteBuffer(
+                item_shape, dtype=dtype, device=device, pin_memory=pin_memory
+            )
         else:
-            return _CircularBuffer(item_shape, buffer_size, dtype=dtype, device=device)
+            return _CircularBuffer(
+                item_shape,
+                buffer_size,
+                dtype=dtype,
+                device=device,
+                pin_memory=pin_memory,
+            )
 
     def append(self, value: torch.Tensor):
         raise NotImplementedError
@@ -1427,11 +1438,17 @@ class _Buffer:
 
 
 class _CircularBuffer(_Buffer):
-    def __init__(self, item_shape: Tuple, buffer_size: int, dtype, device):
+    def __init__(
+        self, item_shape: Tuple, buffer_size: int, dtype, device, pin_memory: bool = False
+    ):
         self._buffer = torch.zeros(
-            (buffer_size, *item_shape), dtype=dtype, device=device
+            (buffer_size, *item_shape),
+            dtype=dtype,
+            device=device,
+            pin_memory=pin_memory,
         )
         self._curr_index = 0
+        self._pin_memory = pin_memory
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
@@ -1449,14 +1466,21 @@ class _CircularBuffer(_Buffer):
             buffer_size=len(self._buffer),
             dtype=self._buffer.dtype,
             device=self._buffer.device,
+            pin_memory=self._pin_memory,
         )
 
 
 class _InfiniteBuffer(_Buffer):
-    def __init__(self, item_shape: Tuple, dtype, device):
+    def __init__(self, item_shape: Tuple, dtype, device, pin_memory: bool = False):
         self._item_shape = item_shape
-        self._buffer = torch.zeros((128, *item_shape), dtype=dtype, device=device)
+        self._buffer = torch.zeros(
+            (128, *item_shape),
+            dtype=dtype,
+            device=device,
+            pin_memory=pin_memory,
+        )
         self._size = 0
+        self._pin_memory = pin_memory
 
     def append(self, value: torch.Tensor):
         curr_buffer_size = len(self._buffer)
@@ -1465,7 +1489,10 @@ class _InfiniteBuffer(_Buffer):
 
         if self._size == curr_buffer_size:
             new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
+                (2 * curr_buffer_size, *self._item_shape),
+                dtype=dtype,
+                device=device,
+                pin_memory=self._pin_memory,
             )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
@@ -1485,6 +1512,7 @@ class _InfiniteBuffer(_Buffer):
             item_shape=self._item_shape,
             dtype=self._buffer.dtype,
             device=self._buffer.device,
+            pin_memory=self._pin_memory,
         )
 
 
@@ -1507,6 +1535,23 @@ def _convert_global_physical_count_to_logical_count(
         assert physical_to_logical_map.dim() == 3
         assert physical_to_logical_map.shape[0] == dim_extra
         index = physical_to_logical_map
+    if device.type == "cuda" and index.device.type == "cpu":
+        current_stream = torch.cuda.current_stream(device=device)
+        convert_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(convert_stream):
+            convert_stream.wait_stream(current_stream)
+            index = index.to(
+                device=device,
+                dtype=torch.int64,
+                non_blocking=index.is_pinned(),
+            )
+            logical_count.scatter_add_(
+                dim=2,
+                index=index,
+                src=global_physical_count,
+            )
+        current_stream.wait_stream(convert_stream)
+        return logical_count
     logical_count.scatter_add_(
         dim=2,
         index=index.to(device=device, dtype=torch.int64),

@@ -2,9 +2,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
+    _Buffer,
+    AsyncRebalanceSnapshot,
     _convert_global_physical_count_to_logical_count,
 )
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -27,11 +28,10 @@ def test_async_post_launch_prepare_is_disabled():
     assert manager._should_use_post_launch_async_prepare() is False
 
 
-def test_post_launch_async_prepare_submits_after_graph_launch():
+def test_post_launch_async_prepare_submits_on_forward_pass_end():
     recorder = SimpleNamespace(
         skip_next_forward_pass=Mock(),
         prepare_async_rebalance_snapshot=Mock(return_value="snapshot"),
-        detach_async_rebalance_global_physical_count=Mock(return_value="buffer"),
     )
     future = Mock()
     future.done.return_value = False
@@ -118,6 +118,49 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
     manager._apply_prepared_async_rebalance.assert_called_once()
 
 
+def test_post_launch_async_prepare_does_not_apply_in_submit_forward_end():
+    recorder = SimpleNamespace(
+        skip_next_forward_pass=Mock(),
+        prepare_async_rebalance_snapshot=Mock(return_value="snapshot"),
+    )
+    future = Mock()
+    future.done.return_value = True
+    future.result.return_value = "prepared-metadata"
+    executor = Mock()
+    executor.submit.return_value = future
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._server_args = SimpleNamespace(enable_eplb_async=True)
+    manager._rebalance_num_iterations = 4
+    manager._use_post_launch_async_prepare = True
+    manager._pending_rebalance_snapshot = "snapshot"
+    manager._prepare_future = None
+    manager._prepare_future_target_forward_pass_id = None
+    manager._prepared_rebalance_metadata = None
+    manager._prepared_update_layer_ids_chunks = None
+    manager._prepared_rebalance_target_forward_pass_id = None
+    manager._prepare_executor = executor
+    manager._prepare_stream = None
+    manager._post_launch_submitted_forward_pass_id = None
+    manager._model_runner = SimpleNamespace(forward_pass_id=4)
+    manager._materialize_async_rebalance_logical_count_snapshot = Mock(
+        return_value=("logical-count", None, 0.2)
+    )
+    manager._finish_async_rebalance_prepare = Mock()
+    manager._compute_update_layer_ids_chunks = Mock(return_value=[[2], [4]])
+    manager._apply_prepared_async_rebalance = Mock()
+
+    with patch(
+        "sglang.srt.eplb.eplb_manager.get_global_expert_distribution_recorder",
+        return_value=recorder,
+    ):
+        manager.on_forward_pass_end()
+
+    manager._apply_prepared_async_rebalance.assert_not_called()
+    assert manager._prepare_future is None
+    assert manager._prepare_future_target_forward_pass_id is None
+
+
 def test_async_logical_count_uses_per_step_mapping():
     global_physical_count = torch.tensor(
         [
@@ -151,3 +194,50 @@ def test_async_logical_count_uses_per_step_mapping():
             dtype=torch.int32,
         ),
     )
+
+
+def test_async_mapping_buffer_uses_pinned_cpu_memory():
+    buffer = _Buffer.init_new(
+        item_shape=(2, 4),
+        buffer_size=2,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    buffer.append(torch.arange(8, dtype=torch.int32).view(2, 4))
+    all_values = buffer.get_all()
+
+    assert all_values.device.type == "cpu"
+    assert all_values.is_pinned()
+
+
+def test_materialize_async_rebalance_uses_frozen_snapshot_buffers():
+    snapshot = AsyncRebalanceSnapshot(
+        num_logical_experts=2,
+        average_utilization_rate_over_window=0.3,
+    )
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepare_stream = None
+    global_physical_count = torch.ones((2, 1, 2), dtype=torch.int32)
+    physical_to_logical_map = torch.zeros((2, 1, 2), dtype=torch.int32)
+
+    with patch(
+        "sglang.srt.eplb.eplb_manager.get_global_expert_distribution_recorder",
+        return_value=SimpleNamespace(
+            detach_async_rebalance_global_physical_count=Mock(
+                return_value=global_physical_count
+            ),
+            detach_async_rebalance_physical_to_logical_map=Mock(
+                return_value=physical_to_logical_map
+            ),
+        ),
+    ):
+        result = manager._materialize_async_rebalance_logical_count_snapshot(snapshot)
+
+    assert result[0] is global_physical_count
+    assert result[1] is physical_to_logical_map
+    assert result[2] == 2
+    assert result[3] is None
+    assert result[4] == 0.3

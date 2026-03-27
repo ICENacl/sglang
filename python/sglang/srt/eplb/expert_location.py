@@ -198,10 +198,10 @@ class ExpertLocationMetadata:
             eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
         ]
 
-        if eplb_algorithms.algorithm_runs_on_cpu(algorithm) or use_async_deepseek_cpp:
+        if use_async_deepseek_cpp:
             logical_count = logical_count.to("cpu")
-            if torch.cuda.is_available() and not logical_count.is_pinned():
-                logical_count = logical_count.pin_memory()
+        elif eplb_algorithms.algorithm_runs_on_cpu(algorithm):
+            pass
         else:
             target_device = (
                 logical_count.device
