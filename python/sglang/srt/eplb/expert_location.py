@@ -199,7 +199,7 @@ class ExpertLocationMetadata:
         ]
 
         if use_async_deepseek_cpp:
-            logical_count = logical_count.to("cpu")
+            assert logical_count.device.type == "cpu"
         elif eplb_algorithms.algorithm_runs_on_cpu(algorithm):
             pass
         else:

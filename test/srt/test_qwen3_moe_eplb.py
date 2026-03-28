@@ -57,7 +57,6 @@ def test_post_launch_async_prepare_submits_on_forward_pass_end():
     )
     manager._finish_async_rebalance_prepare = Mock()
     manager._maybe_collect_prepared_async_rebalance = Mock()
-
     with patch(
         "sglang.srt.eplb.eplb_manager.get_global_expert_distribution_recorder",
         return_value=recorder,
@@ -241,3 +240,134 @@ def test_materialize_async_rebalance_uses_frozen_snapshot_buffers():
     assert result[2] == 2
     assert result[3] is None
     assert result[4] == 0.3
+
+
+def test_init_async_prepare_expert_location_metadata_runs_on_prepare_stream():
+    stream_context = Mock()
+    stream_context.__enter__ = Mock(return_value=None)
+    stream_context.__exit__ = Mock(return_value=None)
+    prepare_stream = Mock()
+    ready_event = Mock()
+    logical_count_cpu = torch.ones((1, 1, 2), dtype=torch.int32)
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepare_stream = prepare_stream
+    manager._server_args = object()
+    manager._model_runner = SimpleNamespace(model_config=object())
+
+    with (
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.stream", return_value=stream_context),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=ready_event),
+        patch(
+            "sglang.srt.eplb.eplb_manager.ExpertLocationMetadata.init_by_eplb",
+            return_value="metadata",
+        ) as init_by_eplb,
+    ):
+        result = manager._init_async_prepare_expert_location_metadata(logical_count_cpu)
+
+    init_by_eplb.assert_called_once_with(
+        manager._server_args,
+        manager._model_runner.model_config,
+        logical_count_cpu,
+    )
+    ready_event.record.assert_called_once_with(prepare_stream)
+    ready_event.synchronize.assert_called_once()
+    assert result == "metadata"
+
+
+def test_materialize_async_rebalance_kicks_off_cuda_d2h_on_prepare_stream():
+    stream_context = Mock()
+    stream_context.__enter__ = Mock(return_value=None)
+    stream_context.__exit__ = Mock(return_value=None)
+    prepare_stream = Mock()
+    ready_event = Mock()
+    copy_done_event = Mock()
+    snapshot = AsyncRebalanceSnapshot(
+        num_logical_experts=2,
+        average_utilization_rate_over_window=0.3,
+        ready_event=ready_event,
+    )
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepare_stream = prepare_stream
+    cuda_tensor = Mock()
+    cuda_tensor.is_cuda = True
+    physical_to_logical_map = torch.zeros((2, 1, 2), dtype=torch.int32)
+    global_physical_count_cpu = Mock()
+
+    with (
+        patch(
+            "sglang.srt.eplb.eplb_manager.get_global_expert_distribution_recorder",
+            return_value=SimpleNamespace(
+                detach_async_rebalance_global_physical_count=Mock(return_value=cuda_tensor),
+                detach_async_rebalance_physical_to_logical_map=Mock(
+                    return_value=physical_to_logical_map
+                ),
+            ),
+        ),
+        patch("sglang.srt.eplb.eplb_manager.torch.empty", return_value=global_physical_count_cpu),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.stream", return_value=stream_context),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=copy_done_event),
+    ):
+        result = manager._materialize_async_rebalance_logical_count_snapshot(snapshot)
+
+    prepare_stream.wait_event.assert_called_once_with(ready_event)
+    global_physical_count_cpu.copy_.assert_called_once_with(cuda_tensor, non_blocking=True)
+    copy_done_event.record.assert_called_once_with(prepare_stream)
+    assert result[0] is global_physical_count_cpu
+    assert result[1] is physical_to_logical_map
+    assert result[2] == 2
+    assert result[3] is copy_done_event
+    assert result[4] == 0.3
+
+
+def test_finish_async_rebalance_prepare_moves_logical_count_d2h_to_prepare_stream():
+    stream_context = Mock()
+    stream_context.__enter__ = Mock(return_value=None)
+    stream_context.__exit__ = Mock(return_value=None)
+    prepare_stream = Mock()
+    logical_count_cuda = Mock()
+    logical_count_cuda.device.type = "cuda"
+    logical_count_cuda.shape = (2, 1, 2)
+    logical_count_cuda.dtype = torch.int32
+    logical_count_cpu = Mock()
+    ready_event = Mock()
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepare_stream = prepare_stream
+    manager._server_args = object()
+    manager._model_runner = SimpleNamespace(model_config=object())
+    manager._check_rebalance_needed = Mock(return_value=True)
+
+    with (
+        patch(
+            "sglang.srt.eplb.eplb_manager._convert_global_physical_count_to_logical_count",
+            return_value=logical_count_cuda,
+        ),
+        patch("sglang.srt.eplb.eplb_manager.torch.empty", return_value=logical_count_cpu),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.stream", return_value=stream_context),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=ready_event),
+        patch(
+            "sglang.srt.eplb.eplb_manager.ExpertLocationMetadata.init_by_eplb",
+            return_value="metadata",
+        ) as init_by_eplb,
+    ):
+        result = manager._finish_async_rebalance_prepare(
+            (
+                torch.ones((2, 1, 2), dtype=torch.int32),
+                torch.zeros((2, 1, 2), dtype=torch.int32),
+                2,
+                None,
+                0.3,
+            )
+        )
+
+    logical_count_cpu.copy_.assert_called_once_with(logical_count_cuda, non_blocking=True)
+    ready_event.record.assert_called_once_with(prepare_stream)
+    ready_event.synchronize.assert_called_once()
+    init_by_eplb.assert_called_once_with(
+        manager._server_args,
+        manager._model_runner.model_config,
+        logical_count_cpu,
+    )
+    assert result == "metadata"
