@@ -41,7 +41,6 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
-        self._enable_async_eplb = self._server_args.enable_eplb_async
         self._use_post_launch_async_prepare = self._should_use_post_launch_async_prepare()
         self._prepared_rebalance_metadata = None
         self._prepared_update_layer_ids_chunks = None
@@ -52,23 +51,21 @@ class EPLBManager:
         self._post_launch_submitted_forward_pass_id = None
         self._prepare_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb-prepare")
-            if self._enable_async_eplb and self._use_post_launch_async_prepare
+            if self._use_post_launch_async_prepare
             else None
         )
         self._prepare_stream = (
             torch.cuda.Stream()
-            if self._enable_async_eplb and torch.cuda.is_available()
+            if self._server_args.enable_eplb_async and torch.cuda.is_available()
             else None
         )
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_start(self):
-        if not self._enable_async_eplb:
-            return
         return
 
     def on_forward_graph_launched(self):
-        if not self._enable_async_eplb:
+        if not self._server_args.enable_eplb_async:
             return
         if not self._use_post_launch_async_prepare:
             return
@@ -99,24 +96,21 @@ class EPLBManager:
         self._prepare_future_target_forward_pass_id = target_forward_pass_id
 
     def on_forward_pass_end(self):
-        if self._enable_async_eplb:
-            self._on_async_forward_pass_end()
+        if self._server_args.enable_eplb_async:
+            if self._use_post_launch_async_prepare:
+                self._post_launch_submitted_forward_pass_id = None
+                self._handle_post_launch_async_rebalance_on_forward_end()
+                return
+            if (
+                self._model_runner.forward_pass_id % self._rebalance_num_iterations
+                == self._rebalance_num_iterations - 1
+            ):
+                get_global_expert_distribution_recorder().skip_next_forward_pass()
+            if self._model_runner.forward_pass_id % self._rebalance_num_iterations == 0:
+                self._prepare_async_rebalance()
+                self._apply_prepared_async_rebalance()
             return
         next(self._main_generator)
-
-    def _on_async_forward_pass_end(self):
-        if self._use_post_launch_async_prepare:
-            self._post_launch_submitted_forward_pass_id = None
-            self._handle_post_launch_async_rebalance_on_forward_end()
-            return
-        if (
-            self._model_runner.forward_pass_id % self._rebalance_num_iterations
-            == self._rebalance_num_iterations - 1
-        ):
-            get_global_expert_distribution_recorder().skip_next_forward_pass()
-        if self._model_runner.forward_pass_id % self._rebalance_num_iterations == 0:
-            self._prepare_async_rebalance()
-            self._apply_prepared_async_rebalance()
 
     # can be more complex if needed
     def _entrypoint(self):
@@ -127,7 +121,7 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
-        mode = "async" if self._enable_async_eplb else "sync"
+        mode = "async" if self._server_args.enable_eplb_async else "sync"
         logger.info(f"[EPLBManager] rebalance start mode={mode}")
 
         enable_timing = self._rebalance_layers_per_chunk is None
@@ -380,7 +374,7 @@ class EPLBManager:
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 
     def _should_use_post_launch_async_prepare(self) -> bool:
-        return self._enable_async_eplb and False
+        return False
 
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):
