@@ -48,6 +48,7 @@ def test_post_launch_async_prepare_submits_on_forward_pass_end():
     manager._prepared_rebalance_metadata = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
+    manager._prepared_rebalance_ready_event = None
     manager._prepare_executor = executor
     manager._prepare_stream = None
     manager._post_launch_submitted_forward_pass_id = None
@@ -100,6 +101,7 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
     manager._prepared_rebalance_metadata = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
+    manager._prepared_rebalance_ready_event = None
     manager._pending_rebalance_snapshot = None
     manager._model_runner = SimpleNamespace(forward_pass_id=4)
     manager._compute_update_layer_ids_chunks = Mock(return_value=[[2], [4]])
@@ -138,6 +140,7 @@ def test_post_launch_async_prepare_does_not_apply_in_submit_forward_end():
     manager._prepared_rebalance_metadata = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
+    manager._prepared_rebalance_ready_event = None
     manager._prepare_executor = executor
     manager._prepare_stream = None
     manager._post_launch_submitted_forward_pass_id = None
@@ -158,6 +161,31 @@ def test_post_launch_async_prepare_does_not_apply_in_submit_forward_end():
     manager._apply_prepared_async_rebalance.assert_not_called()
     assert manager._prepare_future is None
     assert manager._prepare_future_target_forward_pass_id is None
+
+
+def test_post_launch_async_prepare_waits_ready_event_before_apply():
+    ready_event = Mock()
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepared_rebalance_metadata = "prepared-metadata"
+    manager._prepared_rebalance_ready_event = ready_event
+    manager._prepared_update_layer_ids_chunks = [[2], [4]]
+    manager._prepared_rebalance_target_forward_pass_id = 4
+    manager._model_runner = SimpleNamespace(update_expert_location=Mock())
+
+    manager._apply_prepared_async_rebalance()
+
+    ready_event.synchronize.assert_called_once()
+    manager._model_runner.update_expert_location.assert_any_call(
+        "prepared-metadata",
+        update_layer_ids=[2],
+    )
+    manager._model_runner.update_expert_location.assert_any_call(
+        "prepared-metadata",
+        update_layer_ids=[4],
+    )
+    assert manager._prepared_rebalance_metadata is None
+    assert manager._prepared_rebalance_ready_event is None
 
 
 def test_async_logical_count_uses_per_step_mapping():
