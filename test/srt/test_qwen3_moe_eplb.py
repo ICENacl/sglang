@@ -63,7 +63,7 @@ def test_post_launch_async_prepare_submits_on_forward_pass_end():
     ):
         manager.on_forward_pass_end()
 
-        recorder.skip_next_forward_pass.assert_called_once()
+        recorder.skip_next_forward_pass.assert_not_called()
         recorder.prepare_async_rebalance_snapshot.assert_called_once()
         assert manager._pending_rebalance_snapshot == "snapshot"
 
@@ -209,8 +209,6 @@ def test_async_mapping_buffer_uses_pinned_cpu_memory():
 
     assert all_values.device.type == "cpu"
     assert all_values.is_pinned()
-
-
 def test_materialize_async_rebalance_uses_frozen_snapshot_buffers():
     snapshot = AsyncRebalanceSnapshot(
         num_logical_experts=2,

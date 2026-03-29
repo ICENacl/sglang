@@ -7,13 +7,13 @@
   - 这一步只为 `forward N` 准备更新计划，不在 `forward N-1` 结束时直接 launch H2D。
 - `forward N` 开始时激活上一轮已经准备好的 rebalance plan。
 - `forward N` 内，某个 layer 在 `set_cpu_stage()` 后即可立刻启动该 layer 的 H2D 权重交换，不再等整个 `forward N` 结束。
-- async 统计改成“事件发生时直接累计 logical count，并支持按 layer 清零”，不再依赖 `dump_record()` 时用全局 metadata 把 physical count 解释回 logical count。
+- async 统计重新对齐到 sync 语义：窗口内继续累计 `physical count`，并按 forward 冻结 `physical_to_logical_map`，在 rebalance 边界统一转换 `logical count`。
 - 因此新的 `expert_location_metadata` 可以在某个 layer 的 H2D 完成后立即按 layer 发布，不再等到 `forward N+1` 开始前。
 - 如果当前 plan 跨多个 split/piecewise forward 才能覆盖完所有 layer，则 metadata 按“本轮已经完成 copy 的 layer slice”渐进提交，未执行到的 layer 保留到后续 forward 继续完成。
 - 因此当前实现的时序是：
   - `forward N-1` 产出 plan
   - `forward N` 执行 copy
-  - `forward N` 内某个 layer copy 完成后立即 publish 该 layer metadata，并清零该 layer 的 async 统计窗口
+  - `forward N` 内某个 layer copy 完成后立即 publish 该 layer metadata
   - 后续 forward 从该 layer 下一次真正参与路由起按新 metadata 继续累计
 
 ## 为什么放在 EP 子类
@@ -56,7 +56,7 @@
 - 当前实现不再依赖 Python `set_cpu_stage()` 直接消费 plan。
 - `DeepEPMoE.forward()` 的 `set_cpu_stage(self.layer_id)` 只负责在 graph 内把 signal 切到 `CPU owner`。
 - `ExpertLocationUpdater` 不再维护 Python monitor/copy worker，也不再持有 per-layer signal tensor。
-- plan 消费、host `wait_cpu_stage`、copy stream 上的 H2D、GPU metadata publish、统计清零与 CPU metadata mirror 都收敛到 `eplb_async_runtime_cpp`：
+- plan 消费、host `wait_cpu_stage`、copy stream 上的 H2D、GPU metadata publish 与 CPU metadata mirror 都收敛到 `eplb_async_runtime_cpp`：
   - `start_iter(step, enable_statistic)` 只入队 iter，不在 forward 前半段等待设备事件
   - `worker_loop()` 按 layer 执行 `wait_last_update_done -> set_gpu_stage_host -> wait_cpu_stage_host -> enqueue_update`
   - `update_loop()` 只负责 H2D/update task
@@ -65,18 +65,19 @@
 ### 5. metadata publish 与统计窗口
 
 - 当前 forward 内，同一个 layer 在 `set_cpu_stage()` 之后才允许 host 启动该 layer 的 H2D，因此本轮该 layer 的 compute 与该次更新不会再并发读写同一 live slot。
-- 为了让 H2D 完成后立刻 publish 不引入统计解释错误，async 统计不再走“先累计 physical count，dump 时再按 metadata 转 logical”的旧链路，而是拆成两类：
-  - `select_experts` 路径：在 logical id 阶段直接累计 logical count
-  - `deepep` / `mooncake` dispatcher 路径：在 dispatch 事件发生时，按当时生效的 layer mapping 立即把 physical count 累加成 logical count
+- 为了让 metadata 更新不污染 rebalance 输入，async 统计继续走“先累计 physical count，rebalance 时再统一转 logical”的链路，但为每个 forward 冻结一份 `physical_to_logical_map`：
+  - `select_experts` 路径：累计 physical expert 命中数
+  - `deepep` / `mooncake` dispatcher 路径：累计 dispatch 侧 physical count
+  - rebalance 时按每个 forward 自己冻结的 mapping 做 `scatter_add`
 - 当某个 layer 的 H2D 完成后，completion 线程立刻执行：
   - `current_metadata.update(new_metadata, update_layer_ids=[layer_id])`
-  - `reset_async_layer_statistics([layer_id])`
+- 不再清零该 layer 的统计窗口；旧 forward 的统计仍按各自冻结的 mapping 解释
 - 当前实现不再在 update 完成时把同一步 signal re-arm 回 `GPU owner`。
 - 下一次真正的 `start_iter(step)` 才会由 host 写入新的 `GPU owner + step/skip_step` signal。
 - 这和 TRT-LLM 的边界一致，避免 update 线程在同一步里反向改写 signal。
 - 这样即使存在 split/piecewise forward：
   - 已完成 copy 的 layer 会立即切到新 metadata
-  - 该 layer 的旧统计窗口会被清零，不会跨 placement 混算
+  - 旧 forward 的统计继续保留，并按各自冻结的 mapping 解释
   - 未执行到的 pending layer 继续保留在 active plan 中，滚到后续 forward 再完成
   - `forward end` 仍只等待本轮已启动但尚未完成的 layer copy 收尾；未启动的 pending layer 不阻塞本轮结束
 
@@ -112,7 +113,7 @@
 - 当前 async 路径不保留 same-gpu/free-rider live->live 复用优化。
 - 当前 async plan 的消费不再依赖 `DeepEPMoE.forward()` 中的 Python launch hook，而是依赖 runtime host worker 观察设备侧 signal。
 - async metadata publish 不再调用 `ExpertLocationMetadata.update()` 做整表 merge，而是保持全局 metadata 对象稳定，在对象内部做 per-layer published view 切换。
-- async 统计不再依赖 dump 时的全局 metadata 解释，而是改成 per-layer logical count + per-layer reset。
+- async 统计恢复为 sync 对齐语义：按 forward 冻结 mapping，再在 rebalance 边界统一把 buffered physical count 转成 logical count。
 
 ## 代码落点
 
@@ -144,7 +145,7 @@
   - host 侧 `set_gpu_stage`
   - host 侧 `wait_cpu_stage`
   - update task 调度
-  - copy stream 上的 H2D、GPU metadata 切换、统计清零
+  - copy stream 上的 H2D、GPU metadata 切换
   - update 完成后的 CPU metadata mirror 更新
 - C++ 源文件放在 `python/sglang/jit_kernel/csrc/eplb_async_runtime.cpp`，与现有 EPLB signal JIT kernel 的代码布局保持一致。
 - 这次重构的目标不是改数据路径，而是把原来会拖慢 host scheduler 的 Python 轮询和 Python publish 状态机移出主路径。

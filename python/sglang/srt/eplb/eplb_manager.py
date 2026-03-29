@@ -101,11 +101,6 @@ class EPLBManager:
                 self._post_launch_submitted_forward_pass_id = None
                 self._handle_post_launch_async_rebalance_on_forward_end()
                 return
-            if (
-                self._model_runner.forward_pass_id % self._rebalance_num_iterations
-                == self._rebalance_num_iterations - 1
-            ):
-                get_global_expert_distribution_recorder().skip_next_forward_pass()
             if self._model_runner.forward_pass_id % self._rebalance_num_iterations == 0:
                 self._prepare_async_rebalance()
                 self._apply_prepared_async_rebalance()
@@ -191,7 +186,6 @@ class EPLBManager:
             forward_pass_id % self._rebalance_num_iterations
             == self._rebalance_num_iterations - 1
         ):
-            get_global_expert_distribution_recorder().skip_next_forward_pass()
             if (
                 self._pending_rebalance_snapshot is None
                 and self._prepare_future is None

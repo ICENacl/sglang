@@ -591,33 +591,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._accumulator.detach_physical_to_logical_map_buffer()
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
-        if not self._enable_async_eplb:
-            return
-        if len(layer_ids) == 0:
-            return
-        if (
-            hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
-            and self._accumulator._global_physical_count_of_buffered_step is not None
-        ):
-            self._accumulator._global_physical_count_of_buffered_step.get_all()[
-                :, layer_ids, :
-            ] = 0
+        return
 
     def get_async_runtime_reset_tensor_specs(self) -> List[Tuple[torch.Tensor, int]]:
-        if not self._enable_async_eplb:
-            return []
-        specs: List[Tuple[torch.Tensor, int]] = []
-        if (
-            hasattr(self._accumulator, "_global_physical_count_of_buffered_step")
-            and self._accumulator._global_physical_count_of_buffered_step is not None
-        ):
-            specs.append(
-                (
-                    self._accumulator._global_physical_count_of_buffered_step.get_all(),
-                    1,
-                )
-            )
-        return specs
+        return []
 
     def _get_global_average_utilization_rate(self):
         if hasattr(self._accumulator, "_get_global_average_utilization_rate"):
