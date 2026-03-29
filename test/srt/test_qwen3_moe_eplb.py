@@ -25,7 +25,29 @@ def test_qwen3_moe_eplb_uses_realized_layer_mapping():
 
 def test_async_post_launch_prepare_is_disabled():
     manager = EPLBManager.__new__(EPLBManager)
+    manager._enable_async_eplb = True
     assert manager._should_use_post_launch_async_prepare() is False
+
+
+def test_sync_forward_pass_end_does_not_enter_async_path():
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._enable_async_eplb = False
+    manager._main_generator = iter([None])
+    manager._on_async_forward_pass_end = Mock()
+
+    manager.on_forward_pass_end()
+
+    manager._on_async_forward_pass_end.assert_not_called()
+
+
+def test_async_forward_pass_end_uses_async_path():
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._enable_async_eplb = True
+    manager._on_async_forward_pass_end = Mock()
+
+    manager.on_forward_pass_end()
+
+    manager._on_async_forward_pass_end.assert_called_once()
 
 
 def test_post_launch_async_prepare_submits_on_forward_pass_end():

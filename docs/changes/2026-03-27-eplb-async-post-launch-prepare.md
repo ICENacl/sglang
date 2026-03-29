@@ -45,3 +45,4 @@
 - `init_by_eplb()` 的重计算不再放在 `forward start` 的 scheduler 主路径。
 - 和 rebalance prepare 相关的统计快照 / D2H memory op 被挪到了 post-launch 阶段，并放到独立的 EPLB prepare stream 上。
 - 如果某次 prepare 比一轮 forward 更慢，系统会延后 apply，而不是重新在 host 上同步等待。
+- sync EPLB 路径不会再进入任何 async 的 `forward_pass_start/end` 或 graph-launched 处理分支。
