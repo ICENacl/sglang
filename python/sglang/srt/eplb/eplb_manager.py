@@ -368,7 +368,7 @@ class EPLBManager:
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 
     def _should_use_post_launch_async_prepare(self) -> bool:
-        return True
+        return False
 
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):

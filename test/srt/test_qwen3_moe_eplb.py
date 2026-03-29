@@ -23,9 +23,9 @@ def test_qwen3_moe_eplb_uses_realized_layer_mapping():
     assert manager._compute_update_layer_ids_chunks() == [[2], [4]]
 
 
-def test_async_post_launch_prepare_is_enabled():
+def test_async_post_launch_prepare_is_disabled():
     manager = EPLBManager.__new__(EPLBManager)
-    assert manager._should_use_post_launch_async_prepare() is True
+    assert manager._should_use_post_launch_async_prepare() is False
 
 
 def test_post_launch_async_prepare_submits_on_forward_pass_end():
@@ -209,8 +209,6 @@ def test_async_mapping_buffer_uses_pinned_cpu_memory():
 
     assert all_values.device.type == "cpu"
     assert all_values.is_pinned()
-
-
 def test_materialize_async_rebalance_uses_frozen_snapshot_buffers():
     snapshot = AsyncRebalanceSnapshot(
         num_logical_experts=2,
