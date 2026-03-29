@@ -45,7 +45,6 @@ class EPLBManager:
         self._prepared_rebalance_metadata = None
         self._prepared_update_layer_ids_chunks = None
         self._prepared_rebalance_target_forward_pass_id = None
-        self._prepared_rebalance_ready_event = None
         self._pending_rebalance_snapshot = None
         self._prepare_future: Future | None = None
         self._prepare_future_target_forward_pass_id = None
@@ -175,10 +174,9 @@ class EPLBManager:
             return
 
         logical_count = self._copy_async_prepare_tensor_to_cpu(logical_count)
-        (
-            self._prepared_rebalance_metadata,
-            self._prepared_rebalance_ready_event,
-        ) = self._init_async_prepare_expert_location_metadata(logical_count)
+        self._prepared_rebalance_metadata = (
+            self._init_async_prepare_expert_location_metadata(logical_count)
+        )
         self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         logger.info("[EPLBManager] async rebalance prepare end")
 
@@ -224,7 +222,7 @@ class EPLBManager:
         if result is None:
             return
 
-        self._prepared_rebalance_metadata, self._prepared_rebalance_ready_event = result
+        self._prepared_rebalance_metadata = result
         self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         self._prepared_rebalance_target_forward_pass_id = target_forward_pass_id
 
@@ -275,11 +273,8 @@ class EPLBManager:
         self, logical_count: torch.Tensor
     ):
         if self._prepare_stream is None:
-            return (
-                ExpertLocationMetadata.init_by_eplb(
-                    self._server_args, self._model_runner.model_config, logical_count
-                ),
-                None,
+            return ExpertLocationMetadata.init_by_eplb(
+                self._server_args, self._model_runner.model_config, logical_count
             )
         with torch.cuda.stream(self._prepare_stream):
             metadata = ExpertLocationMetadata.init_by_eplb(
@@ -287,7 +282,8 @@ class EPLBManager:
             )
             ready_event = torch.cuda.Event()
             ready_event.record(self._prepare_stream)
-        return metadata, ready_event
+        ready_event.synchronize()
+        return metadata
 
     def _materialize_async_rebalance_logical_count_snapshot(
         self,
@@ -338,9 +334,6 @@ class EPLBManager:
     def _apply_prepared_async_rebalance(self):
         if self._prepared_rebalance_metadata is None:
             return
-        if self._prepared_rebalance_ready_event is not None:
-            self._prepared_rebalance_ready_event.synchronize()
-            self._prepared_rebalance_ready_event = None
         logger.info("[EPLBManager] async rebalance apply start")
         for update_layer_ids in self._prepared_update_layer_ids_chunks:
             self._model_runner.update_expert_location(
