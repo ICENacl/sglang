@@ -399,7 +399,6 @@ class EPLBAsyncHostMirrorManager:
                         tensor_index=tensor_index,
                         sample_tensor=tensor,
                     )
-        self._barrier_all_ranks()
 
     def _populate_local_node_shards(
         self, *, routed_experts_weights_of_layer, metadata, pbar=None
