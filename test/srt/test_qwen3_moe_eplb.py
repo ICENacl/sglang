@@ -46,6 +46,7 @@ def test_post_launch_async_prepare_submits_on_forward_pass_end():
     manager._prepare_future = None
     manager._prepare_future_target_forward_pass_id = None
     manager._prepared_rebalance_metadata = None
+    manager._prepared_rebalance_apply_event = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
     manager._prepare_executor = executor
@@ -89,7 +90,7 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
     )
     future = Mock()
     future.done.return_value = True
-    future.result.return_value = "prepared-metadata"
+    future.result.return_value = ("prepared-metadata", "apply-event")
 
     manager = EPLBManager.__new__(EPLBManager)
     manager._server_args = SimpleNamespace(enable_eplb_async=True)
@@ -98,6 +99,7 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
     manager._prepare_future = future
     manager._prepare_future_target_forward_pass_id = 4
     manager._prepared_rebalance_metadata = None
+    manager._prepared_rebalance_apply_event = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
     manager._pending_rebalance_snapshot = None
@@ -112,8 +114,18 @@ def test_post_launch_async_prepare_applies_once_future_is_ready():
         manager.on_forward_pass_end()
 
     assert manager._prepared_rebalance_metadata == "prepared-metadata"
+    assert manager._prepared_rebalance_apply_event == "apply-event"
     assert manager._prepared_update_layer_ids_chunks == [[2], [4]]
-    assert manager._prepared_rebalance_target_forward_pass_id == 4
+    assert manager._prepared_rebalance_target_forward_pass_id == 5
+    manager._apply_prepared_async_rebalance.assert_not_called()
+
+    manager._model_runner.forward_pass_id = 5
+    with patch(
+        "sglang.srt.eplb.eplb_manager.get_global_expert_distribution_recorder",
+        return_value=recorder,
+    ):
+        manager.on_forward_pass_end()
+
     manager._apply_prepared_async_rebalance.assert_called_once()
 
 
@@ -136,6 +148,7 @@ def test_post_launch_async_prepare_does_not_apply_in_submit_forward_end():
     manager._prepare_future = None
     manager._prepare_future_target_forward_pass_id = None
     manager._prepared_rebalance_metadata = None
+    manager._prepared_rebalance_apply_event = None
     manager._prepared_update_layer_ids_chunks = None
     manager._prepared_rebalance_target_forward_pass_id = None
     manager._prepare_executor = executor
@@ -158,6 +171,61 @@ def test_post_launch_async_prepare_does_not_apply_in_submit_forward_end():
     manager._apply_prepared_async_rebalance.assert_not_called()
     assert manager._prepare_future is None
     assert manager._prepare_future_target_forward_pass_id is None
+
+
+def test_async_rebalance_applies_on_next_forward_end():
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._server_args = SimpleNamespace(enable_eplb_async=True)
+    manager._use_post_launch_async_prepare = False
+    manager._rebalance_num_iterations = 4
+    manager._prepared_rebalance_metadata = None
+    manager._prepared_rebalance_apply_event = None
+    manager._prepared_update_layer_ids_chunks = None
+    manager._model_runner = SimpleNamespace(forward_pass_id=4)
+    manager._prepare_async_rebalance = Mock(
+        side_effect=lambda: (
+            setattr(manager, "_prepared_rebalance_metadata", "prepared-metadata"),
+            setattr(manager, "_prepared_rebalance_apply_event", "apply-event"),
+            setattr(manager, "_prepared_update_layer_ids_chunks", [[2], [4]]),
+        )
+    )
+    manager._apply_prepared_async_rebalance = Mock()
+    manager._async_main_generator = manager._async_entrypoint()
+
+    manager.on_forward_pass_end()
+
+    manager._prepare_async_rebalance.assert_called_once()
+    manager._apply_prepared_async_rebalance.assert_not_called()
+
+    manager._model_runner.forward_pass_id = 5
+    manager.on_forward_pass_end()
+
+    manager._apply_prepared_async_rebalance.assert_called_once()
+
+
+def test_apply_prepared_async_rebalance_waits_apply_event():
+    apply_event = Mock()
+
+    manager = EPLBManager.__new__(EPLBManager)
+    manager._prepared_rebalance_metadata = "prepared-metadata"
+    manager._prepared_rebalance_apply_event = apply_event
+    manager._prepared_update_layer_ids_chunks = [[2], [4]]
+    manager._prepared_rebalance_target_forward_pass_id = 5
+    manager._model_runner = SimpleNamespace(update_expert_location=Mock())
+
+    manager._apply_prepared_async_rebalance()
+
+    apply_event.synchronize.assert_called_once()
+    manager._model_runner.update_expert_location.assert_any_call(
+        "prepared-metadata",
+        update_layer_ids=[2],
+    )
+    manager._model_runner.update_expert_location.assert_any_call(
+        "prepared-metadata",
+        update_layer_ids=[4],
+    )
+    assert manager._prepared_rebalance_metadata is None
+    assert manager._prepared_rebalance_apply_event is None
 
 
 def test_async_logical_count_uses_per_step_mapping():
@@ -245,7 +313,7 @@ def test_init_async_prepare_expert_location_metadata_runs_on_prepare_stream():
     stream_context.__enter__ = Mock(return_value=None)
     stream_context.__exit__ = Mock(return_value=None)
     prepare_stream = Mock()
-    ready_event = Mock()
+    apply_event = Mock()
     logical_count_cpu = torch.ones((1, 1, 2), dtype=torch.int32)
 
     manager = EPLBManager.__new__(EPLBManager)
@@ -255,7 +323,7 @@ def test_init_async_prepare_expert_location_metadata_runs_on_prepare_stream():
 
     with (
         patch("sglang.srt.eplb.eplb_manager.torch.cuda.stream", return_value=stream_context),
-        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=ready_event),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=apply_event),
         patch(
             "sglang.srt.eplb.eplb_manager.ExpertLocationMetadata.init_by_eplb",
             return_value="metadata",
@@ -268,9 +336,9 @@ def test_init_async_prepare_expert_location_metadata_runs_on_prepare_stream():
         manager._model_runner.model_config,
         logical_count_cpu,
     )
-    ready_event.record.assert_called_once_with(prepare_stream)
-    ready_event.synchronize.assert_called_once()
-    assert result == "metadata"
+    apply_event.record.assert_called_once_with(prepare_stream)
+    apply_event.synchronize.assert_not_called()
+    assert result == ("metadata", apply_event)
 
 
 def test_materialize_async_rebalance_kicks_off_cuda_d2h_on_prepare_stream():
@@ -329,7 +397,7 @@ def test_finish_async_rebalance_prepare_moves_logical_count_d2h_to_prepare_strea
     logical_count_cuda.shape = (2, 1, 2)
     logical_count_cuda.dtype = torch.int32
     logical_count_cpu = Mock()
-    ready_event = Mock()
+    apply_event = Mock()
 
     manager = EPLBManager.__new__(EPLBManager)
     manager._prepare_stream = prepare_stream
@@ -344,7 +412,7 @@ def test_finish_async_rebalance_prepare_moves_logical_count_d2h_to_prepare_strea
         ),
         patch("sglang.srt.eplb.eplb_manager.torch.empty", return_value=logical_count_cpu),
         patch("sglang.srt.eplb.eplb_manager.torch.cuda.stream", return_value=stream_context),
-        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=ready_event),
+        patch("sglang.srt.eplb.eplb_manager.torch.cuda.Event", return_value=apply_event),
         patch(
             "sglang.srt.eplb.eplb_manager.ExpertLocationMetadata.init_by_eplb",
             return_value="metadata",
@@ -358,14 +426,14 @@ def test_finish_async_rebalance_prepare_moves_logical_count_d2h_to_prepare_strea
                 None,
                 0.3,
             )
-        )
+    )
 
     logical_count_cpu.copy_.assert_called_once_with(logical_count_cuda, non_blocking=True)
-    ready_event.record.assert_called_once_with(prepare_stream)
-    ready_event.synchronize.assert_called_once()
+    apply_event.record.assert_called_once_with(prepare_stream)
+    apply_event.synchronize.assert_not_called()
     init_by_eplb.assert_called_once_with(
         manager._server_args,
         manager._model_runner.model_config,
         logical_count_cpu,
     )
-    assert result == "metadata"
+    assert result == ("metadata", apply_event)
