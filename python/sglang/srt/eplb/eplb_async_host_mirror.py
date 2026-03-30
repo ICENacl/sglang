@@ -423,7 +423,7 @@ class EPLBAsyncHostMirrorManager:
             for tensor_index, tensor in enumerate(tensors):
                 record = self._records[(layer_id, tensor_index)]
                 packed = tensor.index_select(0, local_expert_ids).cpu()
-                record.tensor.index_copy_(0, logical_expert_ids_cpu, packed)
+                _index_copy_host_tensor(record.tensor, logical_expert_ids_cpu, packed)
             valid_tensor.index_fill_(0, logical_expert_ids_cpu, 1)
             if pbar is not None:
                 pbar.update(local_expert_ids_cpu.numel())
@@ -488,7 +488,7 @@ class EPLBAsyncHostMirrorManager:
             elif self._node_rank == dst_node_rank:
                 self._recv_tensor(gpu_staging, src_global_rank)
                 cpu_transfer.copy_(gpu_staging, non_blocking=False)
-                record.tensor.index_copy_(0, logical_expert_ids_cpu, cpu_transfer)
+                _index_copy_host_tensor(record.tensor, logical_expert_ids_cpu, cpu_transfer)
 
         if valid_tensor is not None:
             valid_tensor.index_fill_(0, logical_expert_ids_cpu, 1)
@@ -753,6 +753,24 @@ def _create_buffer_tensor(
     numel = math.prod(shape)
     raw = torch.frombuffer(shm.buf, dtype=torch.uint8)
     return raw.view(dtype)[:numel].view(*shape)
+
+
+def _index_copy_host_tensor(
+    dst: torch.Tensor, index: torch.Tensor, src: torch.Tensor
+) -> None:
+    if dst.dtype not in {
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }:
+        dst.index_copy_(0, index, src)
+        return
+
+    row_nbytes = dst[0].numel() * dst.element_size()
+    dst_bytes = dst.view(torch.uint8).view(dst.shape[0], row_nbytes)
+    src_bytes = src.view(torch.uint8).view(src.shape[0], row_nbytes)
+    dst_bytes.index_copy_(0, index, src_bytes)
 
 
 def _open_shared_memory(*, name: str, create: bool = False, size: int = 0, track: bool = True):
