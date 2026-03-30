@@ -171,8 +171,9 @@ class EPLBAsyncHostMirrorManager:
         self._layer_tensors: dict[int, list[torch.Tensor]] = {}
         self._dummy_layer_tensors: dict[int, list[torch.Tensor]] = {}
         self._layer_num_tensors: dict[int, int] = {}
-        self._gpu_staging_buffers: dict[tuple[int, int], torch.Tensor] = {}
-        self._cpu_transfer_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._tensor_devices: dict[tuple[int, int], torch.device] = {}
+        self._gpu_staging_buffers: dict[tuple[torch.dtype, str, tuple[int, ...]], torch.Tensor] = {}
+        self._cpu_transfer_buffers: dict[tuple[torch.dtype, tuple[int, ...]], torch.Tensor] = {}
         self._leader_device_group = None
         self._leader_cpu_group = None
         self._leader_global_ranks: list[int] = []
@@ -341,6 +342,7 @@ class EPLBAsyncHostMirrorManager:
         self._layer_tensors.clear()
         self._dummy_layer_tensors.clear()
         self._layer_num_tensors.clear()
+        self._tensor_devices.clear()
         self._gpu_staging_buffers.clear()
         self._cpu_transfer_buffers.clear()
         self._leader_device_group = None
@@ -475,8 +477,8 @@ class EPLBAsyncHostMirrorManager:
         for tensor_index in range(self._layer_num_tensors[layer_id]):
             record = self._records[(layer_id, tensor_index)]
             gpu_staging, cpu_transfer = self._get_or_create_transfer_buffers(
-                layer_id=layer_id,
-                tensor_index=tensor_index,
+                sample_tensor=record.tensor,
+                device=self._tensor_devices[(layer_id, tensor_index)],
                 num_logical_experts=num_logical_experts,
             )
             if self._node_rank == src_node_rank:
@@ -566,16 +568,7 @@ class EPLBAsyncHostMirrorManager:
             is_owner=is_owner,
             unlink_on_close=unlink_on_close,
         )
-        self._gpu_staging_buffers[key] = torch.empty(
-            (1, *tensor.shape[1:]),
-            dtype=sample_tensor.dtype,
-            device=sample_tensor.device,
-        )
-        self._cpu_transfer_buffers[key] = torch.empty(
-            (1, *tensor.shape[1:]),
-            dtype=sample_tensor.dtype,
-            pin_memory=True,
-        )
+        self._tensor_devices[key] = sample_tensor.device
         return tensor
 
     def _get_or_create_valid_tensor(self, layer_id: int) -> torch.Tensor:
@@ -722,25 +715,38 @@ class EPLBAsyncHostMirrorManager:
         return local_steps, total_experts, total_bytes
 
     def _get_or_create_transfer_buffers(
-        self, *, layer_id: int, tensor_index: int, num_logical_experts: int
+        self,
+        *,
+        sample_tensor: torch.Tensor,
+        device: torch.device,
+        num_logical_experts: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (layer_id, tensor_index)
-        gpu_staging = self._gpu_staging_buffers[key]
-        cpu_transfer = self._cpu_transfer_buffers[key]
-        if gpu_staging.shape[0] < num_logical_experts:
-            expanded_shape = (num_logical_experts, *gpu_staging.shape[1:])
-            self._gpu_staging_buffers[key] = torch.empty(
-                expanded_shape,
-                dtype=gpu_staging.dtype,
-                device=gpu_staging.device,
+        tail_shape = tuple(sample_tensor.shape[1:])
+        gpu_key = (
+            sample_tensor.dtype,
+            str(device),
+            tail_shape,
+        )
+        cpu_key = (
+            sample_tensor.dtype,
+            tail_shape,
+        )
+        gpu_staging = self._gpu_staging_buffers.get(gpu_key)
+        cpu_transfer = self._cpu_transfer_buffers.get(cpu_key)
+        if gpu_staging is None or gpu_staging.shape[0] < num_logical_experts:
+            self._gpu_staging_buffers[gpu_key] = torch.empty(
+                (num_logical_experts, *tail_shape),
+                dtype=sample_tensor.dtype,
+                device=device,
             )
-            self._cpu_transfer_buffers[key] = torch.empty(
-                expanded_shape,
-                dtype=cpu_transfer.dtype,
+            gpu_staging = self._gpu_staging_buffers[gpu_key]
+        if cpu_transfer is None or cpu_transfer.shape[0] < num_logical_experts:
+            self._cpu_transfer_buffers[cpu_key] = torch.empty(
+                (num_logical_experts, *tail_shape),
+                dtype=sample_tensor.dtype,
                 pin_memory=True,
             )
-            gpu_staging = self._gpu_staging_buffers[key]
-            cpu_transfer = self._cpu_transfer_buffers[key]
+            cpu_transfer = self._cpu_transfer_buffers[cpu_key]
         return gpu_staging[:num_logical_experts], cpu_transfer[:num_logical_experts]
 
 
