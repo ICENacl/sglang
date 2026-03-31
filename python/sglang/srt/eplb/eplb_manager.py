@@ -1,13 +1,10 @@
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import (
-    AsyncRebalanceSnapshot,
-    _convert_global_physical_count_to_logical_count,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -41,20 +38,9 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
-        self._use_post_launch_async_prepare = self._should_use_post_launch_async_prepare()
         self._prepared_rebalance_metadata = None
         self._prepared_rebalance_apply_event = None
         self._prepared_update_layer_ids_chunks = None
-        self._prepared_rebalance_target_forward_pass_id = None
-        self._pending_rebalance_snapshot = None
-        self._prepare_future: Future | None = None
-        self._prepare_future_target_forward_pass_id = None
-        self._post_launch_submitted_forward_pass_id = None
-        self._prepare_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb-prepare")
-            if self._use_post_launch_async_prepare
-            else None
-        )
         self._prepare_stream = (
             torch.cuda.Stream()
             if self._server_args.enable_eplb_async and torch.cuda.is_available()
@@ -66,43 +52,8 @@ class EPLBManager:
     def on_forward_pass_start(self):
         return
 
-    def on_forward_graph_launched(self):
-        if not self._server_args.enable_eplb_async:
-            return
-        if not self._use_post_launch_async_prepare:
-            return
-
-        forward_pass_id = self._model_runner.forward_pass_id
-        if self._post_launch_submitted_forward_pass_id == forward_pass_id:
-            return
-        self._post_launch_submitted_forward_pass_id = forward_pass_id
-
-        if forward_pass_id % self._rebalance_num_iterations != 0:
-            return
-        if self._pending_rebalance_snapshot is None:
-            return
-        if self._prepare_future is not None:
-            return
-
-        logger.info("[EPLBManager] async rebalance post-launch prepare submit")
-        logical_count_snapshot = self._materialize_async_rebalance_logical_count_snapshot(
-            self._pending_rebalance_snapshot
-        )
-        target_forward_pass_id = forward_pass_id
-        self._pending_rebalance_snapshot = None
-        assert self._prepare_executor is not None
-        self._prepare_future = self._prepare_executor.submit(
-            self._finish_async_rebalance_prepare,
-            logical_count_snapshot,
-        )
-        self._prepare_future_target_forward_pass_id = target_forward_pass_id
-
     def on_forward_pass_end(self):
         if self._server_args.enable_eplb_async:
-            if self._use_post_launch_async_prepare:
-                self._post_launch_submitted_forward_pass_id = None
-                self._handle_post_launch_async_rebalance_on_forward_end()
-                return
             next(self._async_main_generator)
             return
         next(self._main_generator)
@@ -194,81 +145,6 @@ class EPLBManager:
         self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
         logger.info("[EPLBManager] async rebalance prepare end")
 
-    def _handle_post_launch_async_rebalance_on_forward_end(self):
-        forward_pass_id = self._model_runner.forward_pass_id
-        if (
-            forward_pass_id % self._rebalance_num_iterations
-            == self._rebalance_num_iterations - 1
-        ):
-            if (
-                self._pending_rebalance_snapshot is None
-                and self._prepare_future is None
-                and self._prepared_rebalance_metadata is None
-            ):
-                snapshot = (
-                    get_global_expert_distribution_recorder().prepare_async_rebalance_snapshot()
-                )
-                if snapshot is not None and self._check_rebalance_needed(
-                    snapshot.average_utilization_rate_over_window
-                ):
-                    self._pending_rebalance_snapshot = snapshot
-            else:
-                logger.info(
-                    "[EPLBManager] Skip creating new post-launch snapshot because previous async rebalance is still pending"
-                )
-
-        self._maybe_collect_prepared_async_rebalance()
-        if (
-            self._prepared_rebalance_metadata is not None
-            and self._prepared_rebalance_target_forward_pass_id is not None
-            and forward_pass_id >= self._prepared_rebalance_target_forward_pass_id
-        ):
-            self._apply_prepared_async_rebalance()
-
-    def _maybe_collect_prepared_async_rebalance(self):
-        if self._prepare_future is None or not self._prepare_future.done():
-            return
-
-        result = self._prepare_future.result()
-        self._prepare_future = None
-        target_forward_pass_id = self._prepare_future_target_forward_pass_id
-        self._prepare_future_target_forward_pass_id = None
-        if result is None:
-            return
-
-        (
-            self._prepared_rebalance_metadata,
-            self._prepared_rebalance_apply_event,
-        ) = result
-        self._prepared_update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
-        self._prepared_rebalance_target_forward_pass_id = target_forward_pass_id + 1
-
-    def _finish_async_rebalance_prepare(self, logical_count_snapshot):
-        (
-            global_physical_count,
-            physical_to_logical_map,
-            num_logical_experts,
-            ready_event,
-            average_utilization_rate_over_window,
-        ) = (
-            logical_count_snapshot
-        )
-        if ready_event is not None:
-            ready_event.synchronize()
-
-        logical_count = _convert_global_physical_count_to_logical_count(
-            global_physical_count=global_physical_count,
-            num_layers=global_physical_count.shape[1],
-            num_logical_experts=num_logical_experts,
-            physical_to_logical_map=physical_to_logical_map,
-        )
-        logical_count = self._copy_async_prepare_tensor_to_cpu(logical_count)
-
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
-            return None
-
-        return self._init_async_prepare_expert_location_metadata(logical_count)
-
     def _copy_async_prepare_tensor_to_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device.type != "cuda":
             return tensor
@@ -304,52 +180,6 @@ class EPLBManager:
             apply_event.record(self._prepare_stream)
         return metadata, apply_event
 
-    def _materialize_async_rebalance_logical_count_snapshot(
-        self,
-        snapshot: AsyncRebalanceSnapshot,
-    ):
-        global_physical_count = (
-            get_global_expert_distribution_recorder().detach_async_rebalance_global_physical_count()
-        )
-        physical_to_logical_map = (
-            get_global_expert_distribution_recorder().detach_async_rebalance_physical_to_logical_map()
-        )
-        if global_physical_count is None:
-            raise RuntimeError("Missing async rebalance global physical count buffer.")
-        if physical_to_logical_map is None:
-            raise RuntimeError("Missing async rebalance physical_to_logical_map buffer.")
-
-        if global_physical_count.is_cuda:
-            assert self._prepare_stream is not None
-            global_physical_count_cpu = torch.empty(
-                global_physical_count.shape,
-                dtype=global_physical_count.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            with torch.cuda.stream(self._prepare_stream):
-                if snapshot.ready_event is not None:
-                    self._prepare_stream.wait_event(snapshot.ready_event)
-                # The detached buffer is no longer mutated by subsequent forwards.
-                global_physical_count_cpu.copy_(global_physical_count, non_blocking=True)
-                ready_event = torch.cuda.Event()
-                ready_event.record(self._prepare_stream)
-            return (
-                global_physical_count_cpu,
-                physical_to_logical_map,
-                snapshot.num_logical_experts,
-                ready_event,
-                snapshot.average_utilization_rate_over_window,
-            )
-
-        return (
-            global_physical_count,
-            physical_to_logical_map,
-            snapshot.num_logical_experts,
-            None,
-            snapshot.average_utilization_rate_over_window,
-        )
-
     def _apply_prepared_async_rebalance(self):
         if self._prepared_rebalance_metadata is None:
             return
@@ -364,7 +194,6 @@ class EPLBManager:
         self._prepared_rebalance_metadata = None
         self._prepared_rebalance_apply_event = None
         self._prepared_update_layer_ids_chunks = None
-        self._prepared_rebalance_target_forward_pass_id = None
         logger.info("[EPLBManager] async rebalance apply end")
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
@@ -389,8 +218,6 @@ class EPLBManager:
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 
-    def _should_use_post_launch_async_prepare(self) -> bool:
-        return False
 
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):
