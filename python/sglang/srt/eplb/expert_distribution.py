@@ -236,8 +236,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
-        self._async_forward_physical_to_logical_map_cpu = (
-            expert_location_metadata.physical_to_logical_map_cpu.clone()
+        self._async_forward_physical_to_logical_map = (
+            expert_location_metadata.physical_to_logical_map.clone()
             if self._enable_async_eplb
             else None
         )
@@ -254,10 +254,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             if (
                 self._enable_async_eplb
                 and self._recording
-                and self._async_forward_physical_to_logical_map_cpu is not None
+                and self._async_forward_physical_to_logical_map is not None
             ):
-                self._async_forward_physical_to_logical_map_cpu[layer_idx].copy_(
-                    self._expert_location_metadata.physical_to_logical_map_cpu[layer_idx]
+                self._async_forward_physical_to_logical_map[layer_idx].copy_(
+                    self._expert_location_metadata.physical_to_logical_map[layer_idx]
                 )
             with self._current_layer_idx.with_value(layer_idx):
                 yield
@@ -342,10 +342,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 )
             if (
                 self._enable_async_eplb
-                and self._async_forward_physical_to_logical_map_cpu is not None
+                and self._async_forward_physical_to_logical_map is not None
             ):
-                single_pass_data["physical_to_logical_map_cpu"] = (
-                    self._async_forward_physical_to_logical_map_cpu
+                single_pass_data["physical_to_logical_map"] = (
+                    self._async_forward_physical_to_logical_map
                 )
             self._accumulator.append(
                 forward_pass_id,
@@ -1221,12 +1221,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._physical_to_logical_map_of_buffered_step = (
             _Buffer.init_new(
                 item_shape=tuple(
-                    self._expert_location_metadata.physical_to_logical_map_cpu.shape
+                    self._expert_location_metadata.physical_to_logical_map.shape
                 ),
                 buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
-                dtype=self._expert_location_metadata.physical_to_logical_map_cpu.dtype,
-                device="cpu",
-                pin_memory=True,
+                dtype=self._expert_location_metadata.physical_to_logical_map.dtype,
+                device=self._expert_location_metadata.physical_to_logical_map.device,
             )
             if self._server_args.enable_eplb_async
             else None
@@ -1258,7 +1257,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.append(buffered_global_physical_count)
         if self._server_args.enable_eplb_async:
             self._physical_to_logical_map_of_buffered_step.append(
-                single_pass_data["physical_to_logical_map_cpu"]
+                single_pass_data["physical_to_logical_map"]
             )
 
     def reset(self):

@@ -55,6 +55,29 @@ def _copy_to_device_if_needed(tensor: torch.Tensor, device: str) -> torch.Tensor
     return tensor.to(device, non_blocking=tensor.device.type == "cpu" and tensor.is_pinned())
 
 
+def _copy_logical_count_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == "cpu":
+        if tensor.is_pinned():
+            return tensor
+        tensor_cpu = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        tensor_cpu.copy_(tensor)
+        return tensor_cpu
+    tensor_cpu = torch.empty(
+        tensor.shape,
+        dtype=tensor.dtype,
+        device="cpu",
+        pin_memory=True,
+    )
+    tensor_cpu.copy_(tensor, non_blocking=True)
+    torch.cuda.current_stream(device=tensor.device).synchronize()
+    return tensor_cpu
+
+
 @dataclass
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
@@ -199,7 +222,7 @@ class ExpertLocationMetadata:
         ]
 
         if use_async_deepseek_cpp:
-            assert logical_count.device.type == "cpu"
+            logical_count = _copy_logical_count_to_pinned_cpu(logical_count)
         elif eplb_algorithms.algorithm_runs_on_cpu(algorithm):
             pass
         else:
