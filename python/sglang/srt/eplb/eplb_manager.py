@@ -152,7 +152,6 @@ class EPLBManager:
 
     def _start_async_rebalance_logical_count_fetch(self):
         logger.info("[EPLBManager] async rebalance logical_count fetch start")
-        get_global_expert_distribution_recorder().materialize_async_snapshot()
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
             output_mode="object"
         )

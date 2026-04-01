@@ -79,13 +79,6 @@ class ExpertDistributionMetrics:
         self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
 
 
-@dataclass
-class AsyncRebalanceSnapshot:
-    num_logical_experts: int
-    average_utilization_rate_over_window: Optional[float]
-    ready_event: Optional[torch.cuda.Event] = None
-
-
 class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
 
@@ -151,18 +144,6 @@ class ExpertDistributionRecorder(ABC):
 
     def skip_next_forward_pass(self):
         pass
-
-    def materialize_async_snapshot(self):
-        pass
-
-    def prepare_async_rebalance_snapshot(self) -> Optional[AsyncRebalanceSnapshot]:
-        return None
-
-    def detach_async_rebalance_global_physical_count(self) -> Optional[torch.Tensor]:
-        return None
-
-    def detach_async_rebalance_physical_to_logical_map(self) -> Optional[torch.Tensor]:
-        return None
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         pass
@@ -558,37 +539,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._enable_async_eplb:
             return
         self._skip_next_forward_pass = True
-
-    def materialize_async_snapshot(self):
-        return
-
-    def prepare_async_rebalance_snapshot(self) -> Optional[AsyncRebalanceSnapshot]:
-        if not self._enable_async_eplb:
-            return None
-        if not hasattr(self._accumulator, "detach_global_physical_count_buffer"):
-            return None
-        return AsyncRebalanceSnapshot(
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
-        )
-
-    def detach_async_rebalance_global_physical_count(self) -> Optional[torch.Tensor]:
-        if not self._enable_async_eplb:
-            return None
-        if not hasattr(self._accumulator, "detach_global_physical_count_buffer"):
-            return None
-
-        detached = self._accumulator.detach_global_physical_count_buffer()
-        if hasattr(self._accumulator, "_history"):
-            self._accumulator._history.clear()
-        return detached
-
-    def detach_async_rebalance_physical_to_logical_map(self) -> Optional[torch.Tensor]:
-        if not self._enable_async_eplb:
-            return None
-        if not hasattr(self._accumulator, "detach_physical_to_logical_map_buffer"):
-            return None
-        return self._accumulator.detach_physical_to_logical_map_buffer()
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         return
@@ -1266,22 +1216,6 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         if self._physical_to_logical_map_of_buffered_step is not None:
             self._physical_to_logical_map_of_buffered_step.reset()
 
-    def detach_global_physical_count_buffer(self) -> torch.Tensor:
-        detached = self._global_physical_count_of_buffered_step.get_all()
-        self._global_physical_count_of_buffered_step = (
-            self._global_physical_count_of_buffered_step.fork_empty()
-        )
-        return detached
-
-    def detach_physical_to_logical_map_buffer(self) -> torch.Tensor:
-        if self._physical_to_logical_map_of_buffered_step is None:
-            raise RuntimeError("Async physical_to_logical_map buffer is not initialized.")
-        detached = self._physical_to_logical_map_of_buffered_step.get_all()
-        self._physical_to_logical_map_of_buffered_step = (
-            self._physical_to_logical_map_of_buffered_step.fork_empty()
-        )
-        return detached
-
     def dump(self, output_mode: _OutputMode):
         buffered_global_physical_count = self._global_physical_count_of_buffered_step.get_all()
         if self._server_args.enable_eplb_async:
@@ -1409,9 +1343,6 @@ class _Buffer:
     def reset(self):
         raise NotImplementedError
 
-    def fork_empty(self):
-        raise NotImplementedError
-
 
 class _CircularBuffer(_Buffer):
     def __init__(
@@ -1435,15 +1366,6 @@ class _CircularBuffer(_Buffer):
 
     def reset(self):
         self._buffer[...] = 0
-
-    def fork_empty(self):
-        return _CircularBuffer(
-            item_shape=tuple(self._buffer.shape[1:]),
-            buffer_size=len(self._buffer),
-            dtype=self._buffer.dtype,
-            device=self._buffer.device,
-            pin_memory=self._pin_memory,
-        )
 
 
 class _InfiniteBuffer(_Buffer):
@@ -1482,14 +1404,6 @@ class _InfiniteBuffer(_Buffer):
     def reset(self):
         self._buffer[...] = 0
         self._size = 0
-
-    def fork_empty(self):
-        return _InfiniteBuffer(
-            item_shape=self._item_shape,
-            dtype=self._buffer.dtype,
-            device=self._buffer.device,
-            pin_memory=self._pin_memory,
-        )
 
 
 def _convert_global_physical_count_to_logical_count(
