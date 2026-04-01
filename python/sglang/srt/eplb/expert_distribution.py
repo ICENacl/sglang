@@ -142,9 +142,6 @@ class ExpertDistributionRecorder(ABC):
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
-    def skip_next_forward_pass(self):
-        pass
-
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         pass
 
@@ -182,7 +179,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
         self._enable_async_eplb = server_args.enable_eplb_async
-        self._skip_next_forward_pass = False
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
@@ -267,10 +263,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
-        skip_rebalance_window = False
-        if self._enable_async_eplb:
-            skip_rebalance_window = self._skip_next_forward_pass
-            self._skip_next_forward_pass = False
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:
@@ -279,7 +271,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 self._on_forward_pass_end(
                     forward_pass_id,
                     outputs,
-                    include_in_rebalance_window=not skip_rebalance_window,
                 )
 
     @contextmanager
@@ -307,7 +298,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self,
         forward_pass_id: int,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool,
     ):
         if not self._recording:
             return
@@ -333,7 +323,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 gatherer_key,
                 single_pass_data,
                 outputs,
-                include_in_rebalance_window,
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -534,11 +523,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
-
-    def skip_next_forward_pass(self):
-        if not self._enable_async_eplb:
-            return
-        self._skip_next_forward_pass = True
 
     def reset_async_layer_statistics(self, layer_ids: List[int]):
         return
@@ -927,7 +911,6 @@ class _Accumulator(ABC):
         gatherer_key: str,
         single_pass_data: Dict,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool = True,
     ):
         pass
 
@@ -959,14 +942,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gatherer_key: str,
         single_pass_data: Dict,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool = True,
     ):
         super().append(
             forward_pass_id,
             gatherer_key,
             single_pass_data,
             outputs,
-            include_in_rebalance_window,
         )
         if self._enable:
             utilization_rate_source = single_pass_data["global_physical_count"]
@@ -979,7 +960,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 forward_pass_id,
                 utilization_rate_source,
                 outputs,
-                include_in_rebalance_window,
             )
 
     def reset(self):
@@ -992,7 +972,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         forward_pass_id: int,
         single_pass_global_physical_count: torch.Tensor,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool,
     ):
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,
@@ -1030,11 +1009,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
-                if self._server_args.enable_eplb_async:
-                    if include_in_rebalance_window:
-                        self._history.append(utilization_rate_cpu)
-                else:
-                    self._history.append(utilization_rate_cpu)
+                self._history.append(utilization_rate_cpu)
 
                 gpu_physical_count_sum = gpu_physical_count.sum().item()
 
@@ -1108,23 +1083,18 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         gatherer_key: str,
         single_pass_data: Dict,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool = True,
     ):
         super().append(
             forward_pass_id,
             gatherer_key,
             single_pass_data,
             outputs,
-            include_in_rebalance_window,
         )
 
         def _process_object(obj):
             if isinstance(obj, torch.Tensor):
                 return obj.cpu().clone()
             return obj
-
-        if self._server_args.enable_eplb_async and not include_in_rebalance_window:
-            return
 
         single_pass_data_processed = {
             k: _process_object(v) for k, v in single_pass_data.items()
@@ -1188,17 +1158,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         gatherer_key: str,
         single_pass_data: Dict,
         outputs: Dict[str, Any],
-        include_in_rebalance_window: bool = True,
     ):
         super().append(
             forward_pass_id,
             gatherer_key,
             single_pass_data,
             outputs,
-            include_in_rebalance_window,
         )
-        if self._server_args.enable_eplb_async and not include_in_rebalance_window:
-            return
         buffered_global_physical_count = single_pass_data["global_physical_count"]
         if self._server_args.enable_eplb_async:
             buffered_global_physical_count = single_pass_data[
