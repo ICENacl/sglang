@@ -182,20 +182,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
-        metadata_device = expert_location_metadata.physical_to_logical_map.device
-        self._metric_source = self._compute_metric_source()
-        self._metric_global_physical_count = (
-            torch.zeros(
-                (
-                    expert_location_metadata.num_layers,
-                    expert_location_metadata.num_physical_experts,
-                ),
-                dtype=torch.int32,
-                device=metadata_device,
-            )
-            if server_args.enable_expert_distribution_metrics
-            else None
-        )
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -217,17 +203,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def with_debug_name(self, debug_name):
         return self._current_debug_name.with_value(debug_name)
-
-    def _compute_metric_source(self) -> Optional[str]:
-        if not self._server_args.enable_expert_distribution_metrics:
-            return None
-        if self._server_args.moe_a2a_backend == "none":
-            return "topk_physical"
-        if self._server_args.deepep_mode == "normal":
-            return "dispatch_normal"
-        if self._server_args.deepep_mode == "low_latency":
-            return "dispatch_low_latency"
-        return None
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
@@ -255,8 +230,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
             return
-        if self._metric_global_physical_count is not None:
-            self._metric_global_physical_count.zero_()
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
@@ -270,10 +243,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            if self._enable_async_eplb and self._metric_global_physical_count is not None:
-                single_pass_data["metric_global_physical_count"] = (
-                    self._metric_global_physical_count
-                )
             self._accumulator.append(
                 forward_pass_id,
                 gatherer_key,
@@ -282,8 +251,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
-        if self._enable_async_eplb:
-            self._append_metric_from_topk_ids(topk_ids)
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(
@@ -293,10 +260,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
-        if self._enable_async_eplb:
-            self._append_metric_from_local_physical_count_list(
-                local_physical_count_of_layer
-            )
         self._on_hook(
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
@@ -308,10 +271,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
-        if self._enable_async_eplb:
-            self._append_metric_from_local_physical_count_tensor(
-                local_physical_count_of_layer
-            )
         self._on_hook(
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,
@@ -345,58 +304,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
-        if self._metric_global_physical_count is not None:
-            self._metric_global_physical_count.zero_()
-
-    def _append_metric_from_topk_ids(self, topk_ids: torch.Tensor):
-        if self._metric_global_physical_count is None:
-            return
-        if self._metric_source != "topk_physical":
-            return
-        if self._current_layer_idx.value is None:
-            return
-        flat_topk_ids = topk_ids.flatten()
-        mask = flat_topk_ids != -1
-        self._metric_global_physical_count[self._current_layer_idx.value, :].scatter_add_(
-            dim=0,
-            index=flat_topk_ids.masked_fill(~mask, 0).long(),
-            src=mask.to(torch.int32),
-        )
-
-    def _append_metric_from_local_physical_count_list(
-        self, local_physical_count_of_layer: List[int]
-    ):
-        if self._metric_global_physical_count is None:
-            return
-        if self._metric_source != "dispatch_normal":
-            return
-        local_physical_count_tensor = torch.tensor(
-            local_physical_count_of_layer,
-            dtype=torch.int32,
-            device=self._metric_global_physical_count.device,
-        )
-        self._append_metric_from_local_physical_count_tensor(
-            local_physical_count_tensor
-        )
-
-    def _append_metric_from_local_physical_count_tensor(
-        self, local_physical_count_of_layer: torch.Tensor
-    ):
-        if self._metric_global_physical_count is None:
-            return
-        if self._metric_source not in ["dispatch_normal", "dispatch_low_latency"]:
-            return
-        if self._current_layer_idx.value is None:
-            return
-        global_physical_count = _convert_local_to_global_physical_count(
-            local_physical_count_of_layer.unsqueeze(0),
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )[0].to(self._metric_global_physical_count.device)
-        self._metric_global_physical_count[
-            self._current_layer_idx.value, :
-        ] += global_physical_count
 
     def start_record(self):
         """Start recording the expert distribution."""
@@ -848,11 +755,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         if self._enable:
             utilization_rate_source = single_pass_data["global_physical_count"]
-            if self._server_args.enable_eplb_async:
-                utilization_rate_source = single_pass_data.get(
-                    "metric_global_physical_count",
-                    utilization_rate_source,
-                )
             return self._append_utilization_rate(
                 forward_pass_id,
                 utilization_rate_source,
