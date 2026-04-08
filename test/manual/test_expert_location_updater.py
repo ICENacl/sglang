@@ -14,6 +14,7 @@ from sglang.srt.eplb import expert_location_updater
 from sglang.srt.eplb.cpp_async_runtime import create_eplb_async_runtime
 from sglang.srt.eplb.eplb_async_host_mirror import (
     EPLBAsyncHostMirrorManager,
+    _build_rank_parallel_cross_node_transfer_plan,
     _build_node_availability_from_metadata,
     _build_cross_node_transfer_plan,
     _compute_local_owner_indices,
@@ -312,6 +313,51 @@ class TestExpertLocationUpdater(CustomTestCase):
                 (1, 2, (1,)),
                 (2, 0, (3,)),
                 (2, 1, (3,)),
+            ],
+        )
+
+    def test_async_host_mirror_rank_parallel_transfer_plan(self):
+        availability = torch.tensor(
+            [
+                [1, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.uint8,
+        )
+        self.assertEqual(
+            _build_rank_parallel_cross_node_transfer_plan(
+                availability,
+                physical_to_logical_map=torch.tensor(
+                    [
+                        0,
+                        2,
+                        0,
+                        5,
+                        1,
+                        6,
+                        7,
+                        8,
+                        3,
+                        9,
+                        10,
+                        11,
+                    ],
+                    dtype=torch.int64,
+                ),
+                local_world_size=2,
+                num_local_physical_experts=2,
+                num_logical_experts=4,
+            ),
+            [
+                (0, 0, 1, 0, (0,)),
+                (0, 0, 1, 1, (2,)),
+                (0, 0, 2, 0, (0,)),
+                (0, 0, 2, 1, (2,)),
+                (1, 0, 0, 1, (1,)),
+                (1, 0, 2, 1, (1,)),
+                (2, 0, 0, 1, (3,)),
+                (2, 0, 1, 1, (3,)),
             ],
         )
 

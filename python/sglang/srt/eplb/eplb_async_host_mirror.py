@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.distributed import P2POp
 from tqdm.auto import tqdm
 
 from sglang.srt.distributed import get_world_group
@@ -55,6 +56,30 @@ def _compute_node_owner_physical_ids(
         if owners[logical_expert_id] == -1:
             owners[logical_expert_id] = global_physical_expert_id
     return owners
+
+
+def _compute_node_owner_local_ranks(
+    physical_to_logical_map: torch.Tensor,
+    *,
+    node_physical_start: int,
+    node_physical_end: int,
+    num_local_physical_experts: int,
+    num_logical_experts: int,
+) -> list[int]:
+    owner_physical_ids = _compute_node_owner_physical_ids(
+        physical_to_logical_map,
+        node_physical_start=node_physical_start,
+        node_physical_end=node_physical_end,
+        num_logical_experts=num_logical_experts,
+    )
+    owner_local_ranks = [-1] * num_logical_experts
+    for logical_expert_id, global_physical_expert_id in enumerate(owner_physical_ids):
+        if global_physical_expert_id == -1:
+            continue
+        owner_local_ranks[logical_expert_id] = (
+            global_physical_expert_id // num_local_physical_experts
+        )
+    return owner_local_ranks
 
 
 def _build_cross_node_transfer_plan(
@@ -107,6 +132,66 @@ def _group_cross_node_transfer_plan(
     return [
         (src_node_rank, dst_node_rank, tuple(logical_expert_ids))
         for (src_node_rank, dst_node_rank), logical_expert_ids in sorted(grouped.items())
+    ]
+
+
+def _build_rank_parallel_cross_node_transfer_plan(
+    availability: torch.Tensor,
+    *,
+    physical_to_logical_map: torch.Tensor,
+    local_world_size: int,
+    num_local_physical_experts: int,
+    num_logical_experts: int,
+) -> list[tuple[int, int, int, int, tuple[int, ...]]]:
+    grouped: dict[tuple[int, int, int, int], list[int]] = {}
+    num_nodes = availability.shape[0]
+    experts_per_node = local_world_size * num_local_physical_experts
+
+    owner_local_ranks_by_node = []
+    for node_rank in range(num_nodes):
+        node_physical_start = node_rank * experts_per_node
+        node_physical_end = node_physical_start + experts_per_node
+        owner_local_ranks_by_node.append(
+            _compute_node_owner_local_ranks(
+                physical_to_logical_map,
+                node_physical_start=node_physical_start,
+                node_physical_end=node_physical_end,
+                num_local_physical_experts=num_local_physical_experts,
+                num_logical_experts=num_logical_experts,
+            )
+        )
+
+    for logical_expert_id in range(num_logical_experts):
+        src_nodes = torch.nonzero(availability[:, logical_expert_id], as_tuple=False).flatten()
+        if src_nodes.numel() == 0:
+            continue
+        src_node_rank = int(src_nodes[0].item())
+        src_global_rank = owner_local_ranks_by_node[src_node_rank][logical_expert_id]
+        if src_global_rank < 0:
+            continue
+        src_local_rank = src_global_rank % local_world_size
+        dst_local_rank = logical_expert_id % local_world_size
+        for dst_node_rank in range(num_nodes):
+            if int(availability[dst_node_rank, logical_expert_id].item()) == 1:
+                continue
+            grouped.setdefault(
+                (src_node_rank, src_local_rank, dst_node_rank, dst_local_rank), []
+            ).append(logical_expert_id)
+
+    return [
+        (
+            src_node_rank,
+            src_local_rank,
+            dst_node_rank,
+            dst_local_rank,
+            tuple(logical_expert_ids),
+        )
+        for (
+            src_node_rank,
+            src_local_rank,
+            dst_node_rank,
+            dst_local_rank,
+        ), logical_expert_ids in sorted(grouped.items())
     ]
 
 
@@ -174,9 +259,6 @@ class EPLBAsyncHostMirrorManager:
         self._tensor_devices: dict[tuple[int, int], torch.device] = {}
         self._gpu_staging_buffers: dict[tuple[torch.dtype, str, tuple[int, ...]], torch.Tensor] = {}
         self._cpu_transfer_buffers: dict[tuple[torch.dtype, tuple[int, ...]], torch.Tensor] = {}
-        self._leader_device_group = None
-        self._leader_cpu_group = None
-        self._leader_global_ranks: list[int] = []
         self._closed = False
         self._registered_atexit = False
         self._lock = threading.Lock()
@@ -188,7 +270,6 @@ class EPLBAsyncHostMirrorManager:
         self._base_name = (
             f"sglang_eplb_async_{model_name}_p{master_port}_n{server_args.node_rank}"
         )
-        self._maybe_create_leader_groups()
 
     def build_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
         if self._dummy_h2d:
@@ -202,6 +283,9 @@ class EPLBAsyncHostMirrorManager:
         num_layers = len(routed_experts_weights_of_layer)
         num_tensor_records = sum(
             len(tensors) for tensors in routed_experts_weights_of_layer.values()
+        )
+        num_record_attach_steps = (
+            num_layers + num_tensor_records if self._world_size > 1 else 0
         )
         num_local_fill_steps = num_layers * metadata.num_local_physical_experts
         layer_transfer_plan = self._build_grouped_cross_node_transfer_plan(
@@ -220,6 +304,7 @@ class EPLBAsyncHostMirrorManager:
             total=(
                 num_layers
                 + num_tensor_records
+                + num_record_attach_steps
                 + num_local_fill_steps
                 + local_remote_transfer_steps
                 + num_tensor_records
@@ -329,14 +414,6 @@ class EPLBAsyncHostMirrorManager:
             if record.unlink_on_close:
                 with contextlib.suppress(FileNotFoundError):
                     record.shm.unlink()
-        if dist.is_initialized():
-            with contextlib.suppress(Exception):
-                if self._leader_device_group is not None:
-                    dist.destroy_process_group(self._leader_device_group)
-            with contextlib.suppress(Exception):
-                if self._leader_cpu_group is not None:
-                    dist.destroy_process_group(self._leader_cpu_group)
-
         self._records.clear()
         self._valid_records.clear()
         self._layer_tensors.clear()
@@ -345,8 +422,6 @@ class EPLBAsyncHostMirrorManager:
         self._tensor_devices.clear()
         self._gpu_staging_buffers.clear()
         self._cpu_transfer_buffers.clear()
-        self._leader_device_group = None
-        self._leader_cpu_group = None
 
     def _build_dummy_from_loaded_model(self, routed_experts_weights_of_layer) -> None:
         self._dummy_layer_tensors.clear()
@@ -401,6 +476,9 @@ class EPLBAsyncHostMirrorManager:
                         tensor_index=tensor_index,
                         sample_tensor=tensor,
                     )
+        self._barrier_all_ranks()
+        if pbar is not None and self._rank == 0 and self._world_size > 1:
+            pbar.update(sum(1 + len(tensors) for tensors in routed_experts_weights_of_layer.values()))
 
     def _populate_local_node_shards(
         self, *, routed_experts_weights_of_layer, metadata, pbar=None
@@ -431,49 +509,62 @@ class EPLBAsyncHostMirrorManager:
                 pbar.update(local_expert_ids_cpu.numel())
 
     def _fill_missing_from_remote_nodes(self, *, layer_transfer_plan, pbar=None) -> None:
-        if self._leader_cpu_group is None:
-            return
-        if not self._is_owner:
+        if (not dist.is_initialized()) or self._num_nodes <= 1:
             return
 
         for layer_id in sorted(layer_transfer_plan):
             transfer_groups = layer_transfer_plan[layer_id]
             if len(transfer_groups) == 0:
+                self._barrier_all_ranks()
                 continue
 
-            for src_node_rank, dst_node_rank, logical_expert_ids in transfer_groups:
-                if self._node_rank not in (src_node_rank, dst_node_rank):
+            for (
+                src_node_rank,
+                src_local_rank,
+                dst_node_rank,
+                dst_local_rank,
+                logical_expert_ids,
+            ) in transfer_groups:
+                if (self._node_rank, self._local_rank) not in (
+                    (src_node_rank, src_local_rank),
+                    (dst_node_rank, dst_local_rank),
+                ):
                     continue
                 self._transfer_logical_expert_group(
                     layer_id=layer_id,
                     src_node_rank=src_node_rank,
+                    src_local_rank=src_local_rank,
                     dst_node_rank=dst_node_rank,
+                    dst_local_rank=dst_local_rank,
                     logical_expert_ids=logical_expert_ids,
                 )
                 if pbar is not None:
                     pbar.update(self._layer_num_tensors[layer_id])
 
-            dist.barrier(group=self._leader_cpu_group)
+            self._barrier_all_ranks()
 
     def _transfer_logical_expert_group(
         self,
         *,
         layer_id: int,
         src_node_rank: int,
+        src_local_rank: int,
         dst_node_rank: int,
+        dst_local_rank: int,
         logical_expert_ids: tuple[int, ...],
     ) -> None:
-        assert self._leader_global_ranks
-        src_global_rank = self._leader_global_ranks[src_node_rank]
-        dst_global_rank = self._leader_global_ranks[dst_node_rank]
+        src_global_rank = src_node_rank * self._local_world_size + src_local_rank
+        dst_global_rank = dst_node_rank * self._local_world_size + dst_local_rank
         logical_expert_ids_cpu = torch.tensor(logical_expert_ids, dtype=torch.int64)
         num_logical_experts = len(logical_expert_ids)
 
-        if self._node_rank == dst_node_rank:
+        if (self._node_rank, self._local_rank) == (dst_node_rank, dst_local_rank):
             valid_tensor = self._valid_records[layer_id].tensor
         else:
             valid_tensor = None
 
+        p2p_ops = []
+        recv_infos = []
         for tensor_index in range(self._layer_num_tensors[layer_id]):
             record = self._records[(layer_id, tensor_index)]
             gpu_staging, cpu_transfer = self._get_or_create_transfer_buffers(
@@ -481,31 +572,46 @@ class EPLBAsyncHostMirrorManager:
                 device=self._tensor_devices[(layer_id, tensor_index)],
                 num_logical_experts=num_logical_experts,
             )
-            if self._node_rank == src_node_rank:
+            if (self._node_rank, self._local_rank) == (src_node_rank, src_local_rank):
                 gpu_staging.copy_(
                     record.tensor.index_select(0, logical_expert_ids_cpu),
                     non_blocking=False,
                 )
-                self._send_tensor(gpu_staging, dst_global_rank)
-            elif self._node_rank == dst_node_rank:
-                self._recv_tensor(gpu_staging, src_global_rank)
+                p2p_ops.append(
+                    P2POp(
+                        op=dist.isend,
+                        tensor=gpu_staging,
+                        peer=dst_global_rank,
+                        group=self._world_group.device_group,
+                    )
+                )
+            elif (self._node_rank, self._local_rank) == (dst_node_rank, dst_local_rank):
+                p2p_ops.append(
+                    P2POp(
+                        op=dist.irecv,
+                        tensor=gpu_staging,
+                        peer=src_global_rank,
+                        group=self._world_group.device_group,
+                    )
+                )
+                recv_infos.append((record.tensor, gpu_staging, cpu_transfer))
+
+        self._execute_batch_p2p_ops(p2p_ops)
+
+        if (self._node_rank, self._local_rank) == (dst_node_rank, dst_local_rank):
+            for dst_tensor, gpu_staging, cpu_transfer in recv_infos:
                 cpu_transfer.copy_(gpu_staging, non_blocking=False)
-                _index_copy_host_tensor(record.tensor, logical_expert_ids_cpu, cpu_transfer)
+                _index_copy_host_tensor(dst_tensor, logical_expert_ids_cpu, cpu_transfer)
 
         if valid_tensor is not None:
             valid_tensor.index_fill_(0, logical_expert_ids_cpu, 1)
 
-    def _send_tensor(self, tensor: torch.Tensor, dst_global_rank: int) -> None:
-        if tensor.is_cuda:
-            dist.send(tensor, dst=dst_global_rank, group=self._leader_device_group)
-        else:
-            dist.send(tensor, dst=dst_global_rank, group=self._leader_cpu_group)
-
-    def _recv_tensor(self, tensor: torch.Tensor, src_global_rank: int) -> None:
-        if tensor.is_cuda:
-            dist.recv(tensor, src=src_global_rank, group=self._leader_device_group)
-        else:
-            dist.recv(tensor, src=src_global_rank, group=self._leader_cpu_group)
+    def _execute_batch_p2p_ops(self, p2p_ops: list[P2POp]) -> None:
+        if len(p2p_ops) == 0:
+            return
+        reqs = dist.batch_isend_irecv(p2p_ops)
+        for req in reqs:
+            req.wait()
 
     def _validate_completeness(self) -> None:
         for layer_id, valid_record in self._valid_records.items():
@@ -519,23 +625,6 @@ class EPLBAsyncHostMirrorManager:
     def _barrier_all_ranks(self) -> None:
         if dist.is_initialized():
             self._world_group.barrier()
-
-    def _maybe_create_leader_groups(self) -> None:
-        if (not dist.is_initialized()) or self._num_nodes <= 1:
-            return
-
-        self._leader_global_ranks = [
-            node_rank * self._local_world_size for node_rank in range(self._num_nodes)
-        ]
-        backend = dist.get_backend(self._world_group.device_group)
-        self._leader_device_group = dist.new_group(
-            self._leader_global_ranks,
-            backend=backend,
-        )
-        self._leader_cpu_group = dist.new_group(
-            self._leader_global_ranks,
-            backend="gloo",
-        )
 
     def _get_or_create_tensor(
         self,
@@ -679,7 +768,7 @@ class EPLBAsyncHostMirrorManager:
 
     def _build_grouped_cross_node_transfer_plan(
         self, *, routed_experts_weights_of_layer, metadata
-    ) -> dict[int, list[tuple[int, int, tuple[int, ...]]]]:
+    ) -> dict[int, list[tuple[int, int, int, int, tuple[int, ...]]]]:
         plan = {}
         num_local_physical_experts = metadata.num_local_physical_experts
         for layer_id in sorted(routed_experts_weights_of_layer):
@@ -690,8 +779,12 @@ class EPLBAsyncHostMirrorManager:
                 num_local_physical_experts=num_local_physical_experts,
                 num_logical_experts=self._num_logical_experts,
             )
-            plan[layer_id] = _group_cross_node_transfer_plan(
-                _build_cross_node_transfer_plan(availability)
+            plan[layer_id] = _build_rank_parallel_cross_node_transfer_plan(
+                availability,
+                physical_to_logical_map=metadata.physical_to_logical_map_cpu[layer_id],
+                local_world_size=self._local_world_size,
+                num_local_physical_experts=num_local_physical_experts,
+                num_logical_experts=self._num_logical_experts,
             )
         return plan
 
@@ -703,10 +796,19 @@ class EPLBAsyncHostMirrorManager:
         total_bytes = 0
         for layer_id, transfer_groups in layer_transfer_plan.items():
             num_tensors = len(routed_experts_weights_of_layer[layer_id])
-            for src_node_rank, dst_node_rank, logical_expert_ids in transfer_groups:
+            for (
+                src_node_rank,
+                src_local_rank,
+                dst_node_rank,
+                dst_local_rank,
+                logical_expert_ids,
+            ) in transfer_groups:
                 num_group_experts = len(logical_expert_ids)
                 total_experts += num_group_experts
-                if self._node_rank in (src_node_rank, dst_node_rank):
+                if (self._node_rank, self._local_rank) in (
+                    (src_node_rank, src_local_rank),
+                    (dst_node_rank, dst_local_rank),
+                ):
                     local_steps += num_tensors
                 for tensor in routed_experts_weights_of_layer[layer_id]:
                     total_bytes += (

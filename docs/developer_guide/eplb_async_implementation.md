@@ -17,9 +17,12 @@
   - 每个 `local rank` 在初始化后根据自己持有的 `physical -> logical` 映射，把本地 expert 写入对应的 logical expert 槽位。
   - 对同一 node 内重复出现的 logical expert，只允许最小 `global_physical_expert_id` 的副本写入，避免 node 内重复存储。
   - 增加 layer 级 `valid bitmap`，用于标记每个 logical expert 是否已经在本 node 的 host mirror 中可用。
-  - 若本 node 本地写入后仍缺失某些 logical experts，则由 `local_rank == 0` 通过跨节点传输在初始化期一次性补齐，最终让每个 node 都持有完整的 logical expert pool。
+  - 若本 node 本地写入后仍缺失某些 logical experts，则通过跨节点传输在初始化期一次性补齐，最终让每个 node 都持有完整的 logical expert pool。
+  - 跨节点补齐继续走 device-group P2P，但不再只由 `local_rank == 0` 单独承担；改为所有 local rank 按 logical expert 分片并行参与。
+  - 每个 logical expert 会绑定唯一的发送 local rank 和接收 local rank，同一个 transfer group 内的多个 tensor 组装成一批 `P2POp`，通过一次 `batch_isend_irecv` 提交。
   - shm 创建逻辑改为对齐 TRT-LLM：先直接 `create=True` 创建，若遇到同名段导致 `FileExistsError`，再记录日志并执行 `close + unlink + recreate`。
   - shm 初始化时序也对齐 TRT-LLM：先由 owner 统一创建/重建所有 shm，经过一次 barrier 后，再由非 owner 进程统一 attach，避免第二次启动时 reader 抢先连接到旧 shm。
+  - host mirror 构建进度会额外等待一次“非 owner attach + `cudaHostRegister` 完成”的 barrier，再结束 `tqdm`，避免进度条先结束但其它 rank 仍在做 host register。
   - shm 命名前缀改为使用 `model_config.hf_config.architectures[0]` 对应的模型名，例如 `Qwen3MoeForCausalLM`，不再直接使用 `server_args.model_path`。
   - 使用 `cudaHostRegister` 让后续 H2D 可异步执行。
 - 在 `FusedMoE.weight_loader` 中增加 host mirror 录制逻辑：
