@@ -107,7 +107,7 @@ class ExpertLocationUpdater:
                 sorted(self._prepared_async_layer_ids),
             )
 
-    def on_capture_forward_pass_start(self):
+    def on_capture_start(self):
         if not self._enable_async or not torch.cuda.is_available():
             return
 
@@ -122,7 +122,7 @@ class ExpertLocationUpdater:
                 sorted(self._prepared_async_layer_ids),
             )
 
-    def on_capture_forward_pass_end(self):
+    def on_capture_end(self):
         if not self._enable_async or not torch.cuda.is_available():
             return
 

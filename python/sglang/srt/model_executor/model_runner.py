@@ -2508,13 +2508,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.expert_location_updater is not None:
             self.expert_location_updater.on_forward_pass_end()
 
-    def on_eplb_async_forward_pass_start(self):
+    def on_eplb_async_capture_start(self):
         if self.expert_location_updater is not None:
-            self.expert_location_updater.on_capture_forward_pass_start()
+            self.expert_location_updater.on_capture_start()
 
-    def on_eplb_async_forward_pass_end(self):
+    def on_eplb_async_capture_end(self):
         if self.expert_location_updater is not None:
-            self.expert_location_updater.on_capture_forward_pass_end()
+            self.expert_location_updater.on_capture_end()
 
     def build_eplb_async_host_mirror(self):
         if self.eplb_async_host_mirror_manager is None:

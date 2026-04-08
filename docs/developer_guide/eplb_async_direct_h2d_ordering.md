@@ -162,6 +162,6 @@
 - 为避免引入新的 pre-EPLB bubble，本次实现明确不在以下路径增加新的 `cudaStreamWaitEvent` / `cudaEventSynchronize`：
   - `prepare_async_layers()`
   - `on_forward_pass_start()`
-  - `on_capture_forward_pass_start()`
+  - `on_capture_start()`
   - layer 入口 `wait_gpu_stage()` 之前
 - 当前仍保留 update 线程里 copy 完成后的后台 `cudaEventSynchronize`，但它不会回流到 forward 起点或 layer 入口前。

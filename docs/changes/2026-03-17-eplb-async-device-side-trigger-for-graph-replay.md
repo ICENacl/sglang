@@ -61,7 +61,7 @@
 
 ### 4. capture/warmup 生命周期与真实 forward 生命周期分离
 
-`on_eplb_async_forward_pass_start/end()` 改为 capture-only：
+`on_eplb_async_capture_start/end()` 改为 capture-only：
 
 - 只重置 signal 到 GPU owner
 - 不激活真实 async plan
